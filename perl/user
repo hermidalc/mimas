@@ -1,0 +1,922 @@
+#!/usr/bin/perl
+
+# user
+# MIMAS Website User Pages and Processing
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+my $base      = MIMAS_SCRIPT_BASE;
+
+## for testing
+# print STDERR map("$_ ---> $params->{$_}\n", sort keys %{$params}), "\n";
+##
+
+my $user_web_pages = {
+                       home  => 1,
+                       info  => 1,
+                       reject_user  => 1,
+                     };
+
+
+my $email_body = <<BODY;
+
+Your MIMAS user account has now been activated!
+
+Please visit http://mimas.vital-it.ch/main?page=login to log in and begin your work.
+
+BODY
+
+#
+## Authentication
+#
+unless (defined $params->{session_id}                                                             and 
+        defined $mimas_web->session($mimas_db->Web->SessionAdaptor->fetch($params->{session_id})) and 
+	defined $mimas_web->session->{login}) {
+    print $mimas_web->cgi->redirect("$base/main?page=login&expired=1");
+    exit;
+}
+
+#
+## Web Page Check
+#
+unless (defined $params->{page} and defined $user_web_pages->{$params->{page}}) {
+    print $mimas_web->cgi->redirect("$base/user?page=home&session_id=$params->{session_id}");
+    exit;
+}
+
+my $web_page   = $params->{page};
+my $session_id = $mimas_web->session->{_session_id};
+
+my $auth_user  = $mimas_db->User->UserAdaptor->select_by_dbID($mimas_web->session->{user_id});
+my $edited_user= $auth_user;
+my $curation_mode = 0;
+my @css;
+
+my @errors;
+
+#allow administrators to edit other users' information
+if ($params->{edited_user} && $params->{edited_user} ne $auth_user->dbID) {
+	if ($auth_user->is_admin) {
+        $edited_user = $mimas_db->User->UserAdaptor->select_by_dbID($params->{edited_user});
+        push @css, "/styles/curation.css?session_id=$session_id";
+        $curation_mode = 1;
+	}
+	else {
+	    push @errors, "Not authorized";
+	}
+}
+
+
+#
+## POST processing & error checking (mirrors JavaScript error checking in case of JavaScript failure)
+#
+if ($mimas_web->cgi->request_method eq 'POST' and $mimas_web->http_referer =~ /^$base/) {
+    #
+    ## USER HOME: remove alerts/information
+    #
+    if ($web_page eq 'home' and defined $params->{remove_alerts}) {
+        my @remove_alerts = split /\0/, $params->{remove_alerts};
+	
+	for my $alert_id (@remove_alerts) {
+	    my $alert = $mimas_db->Web->AlertAdaptor->select_by_dbID($alert_id);
+            if (defined $alert and $alert->user->dbID == $auth_user->dbID) {
+	        if ($alert->type eq 'SAMPLE DOWNLOAD') {
+		    my $filename = $alert->data->{filename};
+		    push @errors, "Download file does not exist in download directory: $filename" unless -e "@{[MIMAS_DOWNLOAD_DIR]}/$filename";
+		}
+	    } else {
+	        push @errors, "Alert ID: $alert_id does not exist in MIMAS!";
+	    }
+        }
+	
+	# process remove alerts if no errors
+        unless (@errors) {
+            eval {
+                $mimas_db->Web->AlertAdaptor->remove_by_dbID($_) for @remove_alerts;
+	         
+		# commit to DB
+		$mimas_db->commit();
+            };
+            
+	    unless ($@) {
+	        # after processing POST without errors recall page as GET
+	        print $mimas_web->cgi->redirect("$base/user?page=${web_page}&session_id=${session_id}");
+	        exit;
+	    } else {
+                push @errors, MIMAS_DB_ERROR_MSG;
+                $mimas_db->warn("REMOVE ALERTS transaction aborted:\n$@");
+            }
+        }
+    }
+    #
+    ## REJECT USER REGISTRATION
+    #
+    elsif ($web_page eq 'reject_user' and $curation_mode) {
+        eval {
+            # Delete User & Lab/Organization (if not already valid)
+            $mimas_db->User->UserAdaptor->remove_by_dbID($edited_user->dbID);
+            $mimas_db->User->LabAdaptor->remove_by_dbID($edited_user->lab->dbID)                        unless $edited_user->lab->valid;
+            $mimas_db->User->OrganizationAdaptor->remove_by_dbID($edited_user->lab->organization->dbID) unless $edited_user->lab->organization->valid;
+
+            # commit to DB
+            $mimas_db->commit();
+        };
+        unless ($@) {
+            # after processing POST redirect to appropriate place
+		    print $mimas_web->cgi->redirect("$base/admin?page=users&session_id=${session_id}");
+            exit;
+        } else {
+            push @errors, MIMAS_DB_ERROR_MSG;
+            $mimas_db->warn("REMOVE ALERTS transaction aborted:\n$@");
+        }
+    }
+    #
+    ## USER/LAB INFORMATION
+    #
+    elsif ($web_page eq 'info') {
+        my $users            = $mimas_db->User->UserAdaptor->select_all();
+        my $labs             = $mimas_db->User->LabAdaptor->select_all();
+	my $named_attributes = $mimas_db->Library->AttributeAdaptor->select_all_attrs();
+	
+	%{$named_attributes} = map { $_->name => $_ } values %{$named_attributes};
+	
+	for my $name (keys %{$params}) {
+	    $params->{$name} = $name eq 'address' ?   clean_freetext($params->{$name})
+	                                          : clean_whitespace($params->{$name});
+	}
+	
+	my (%user_names, %user_emails);
+        for my $user_id (keys %{$users}) {
+            next if $user_id == $edited_user->dbID;
+            $user_names{lc($users->{$user_id}->username)}++;
+	    $user_emails{lc($users->{$user_id}->email)}++;
+        }
+        
+	push @errors, 'Username greater than 15 characters! Please fix username.'                         if length $params->{usernme} > 15;
+	push @errors, 'Password must be greater than 5 characters! Please fix password.'                  if length $params->{password} < 6;
+	push @errors, 'Username contains invalid characters! Please fix username.'                        if $params->{usernme} =~ /\W/;
+	push @errors, 'Username must contain at least one alphabetic character! Please fix username.'     if $params->{usernme} !~ /[a-zA-Z]/;
+	push @errors, 'Password contains invalid characters! Please fix password.'                        if $params->{password} =~ /\s/;
+	push @errors, 'Password and confirmation do not match! Please fix password.'                      if $params->{password} ne $params->{confirm_pass};
+	push @errors, 'Username already exists in MIMAS! Please select another username.'                 if $user_names{lc($params->{usernme})};
+	push @errors, 'Email address already exists in MIMAS! Please contact MIMAS Administrator.'        if $user_emails{lc($params->{email})};
+	push @errors, 'Email address is not in a valid format. Please correct email address.'             if $params->{email}    !~ /^[a-zA-Z0-9_\-\.\+]+@[a-zA-Z0-9_\-\.\+]+$/;
+	push @errors, 'PI email address is not in a valid format. Please correct PI email address.'       if $params->{pi_email} !~ /^[a-zA-Z0-9_\-\.\+]+@[a-zA-Z0-9_\-\.\+]+$/;
+	push @errors, 'PI email already exists for an existing laboratory!. Please change lab selection.' if defined $params->{new_lab} and $mimas_db->User->LabAdaptor->select_by_pi_email_ci($params->{pi_email});
+        push @errors, 'Laboratory name already exists in MIMAS! Please choose another name.'              if defined $params->{new_lab} and $mimas_db->User->LabAdaptor->select_by_name_ci($params->{new_lab});
+        push @errors, 'Laboratory selected does not exist in MIMAS!'                                      unless ($params->{lab_id} and defined $labs->{$params->{lab_id}}) or defined $params->{new_lab};
+	
+        ## can do more server-side error-checking here that JavaScript already does when I have more time (not a priority right now!)
+        ## the real important stuff, usernames & passwords are checked for integrity here
+        
+        ## process registration or update of user information if no errors
+        unless (@errors) {
+
+            my $send_email;
+
+	    eval {
+	        # add 'http://' to urls if they exist and don't already have that
+	        for ($params->{lab_url}, $params->{institute_url}) {
+	            next if !defined or $_ eq '';
+		    s/^\W+//;
+	            s/^http:+\/+/http:\/\//i;
+	            $_ = "http://$_" unless m/^http:\/\//i;
+	        }
+	        
+		# title ID correction
+	        $params->{title_id} = undef unless $params->{title_id};
+		
+	        if (defined $params->{new_lab}) {
+	            # check if organization already exists
+		    my $organization = $mimas_db->User->OrganizationAdaptor->select_by_name_ci($params->{institution});
+                    my $organization_id;
+                    unless (defined $organization) {
+                        $organization_id = $mimas_db->User->OrganizationAdaptor->store(-name       => $params->{institution},
+			                                                               -url        => $params->{institute_url},
+										       -valid      => 1,
+										       -country_id => $params->{country_id});
+			
+			# check if organization attribute detail already exists
+			my $attr_detail = $mimas_db->Library->AttrDetailAdaptor->select_by_attrs_ci(-name         => $params->{institution},
+		                                                                                    -type         => 'value',
+											            -attribute_id => $named_attributes->{'Organization'}->dbID);
+                        unless (defined $attr_detail) {
+			    $mimas_db->Library->AttrDetailAdaptor->store(-name                 => $params->{institution},
+			                                                 -type                 => 'value',
+			                                                 -default              => 0,
+									 -base_conv_scalar     => undef,
+			                                                 -base_conv_factor     => undef,
+			                                                 -description          => undef,
+			                                                 -link_id              => $organization_id,
+									 -attr_detail_group_id => undef,
+                                                                         -mage_name            => undef,
+			                                                 -attribute_id         => $named_attributes->{'Organization'}->dbID);
+                        } else {
+			    $mimas_db->Library->AttrDetailAdaptor->update(-set        => [ -link_id        => $organization_id   ],
+			                                                  -qualifiers => [ -attr_detail_id => $attr_detail->dbID ]);
+			}
+                    } else {
+		        $organization_id = $organization->dbID;
+                    }
+                    
+		    my $lab_name = $params->{new_lab};
+                    $params->{lab_id} = $mimas_db->User->LabAdaptor->store(-name            => $lab_name,
+			                                                   -address         => $params->{address},
+								           -postcode        => $params->{postcode},
+								           -state           => $params->{state},
+								           -city            => $params->{city},
+								           -url             => $params->{lab_url},
+								           -pi_name         => $params->{pi_name},
+								           -pi_email        => $params->{pi_email},
+								           -valid           => 1,
+								           -organization_id => $organization_id);
+                    
+		    # check if laboratory attribute detail already exists
+		    my $attr_detail = $mimas_db->Library->AttrDetailAdaptor->select_by_attrs_ci(-name         => $lab_name,
+		                                                                                -type         => 'value',
+											        -attribute_id => $named_attributes->{'Laboratory/Group Name'}->dbID);
+		    unless (defined $attr_detail) {
+		        $mimas_db->Library->AttrDetailAdaptor->store(-name                 => $lab_name,
+			                                             -type                 => 'value',
+								     -default              => 0,
+			                                             -base_conv_scalar     => undef,
+								     -base_conv_factor     => undef,
+								     -description          => undef,
+								     -link_id              => $params->{lab_id},
+								     -attr_detail_group_id => undef,
+                                                                     -mage_name            => undef,
+								     -attribute_id         => $named_attributes->{'Laboratory/Group Name'}->dbID);
+                    } else {
+		        $mimas_db->Library->AttrDetailAdaptor->update(-set        => [ -link_id        => $params->{lab_id}  ],
+			                                              -qualifiers => [ -attr_detail_id => $attr_detail->dbID ]);
+		    }
+	        }
+		elsif (($edited_user->is_pi or $auth_user->is_admin) and $edited_user->lab->dbID == $params->{lab_id}) {
+		    # check if organization already exists
+		    my $organization = $mimas_db->User->OrganizationAdaptor->select_by_name_ci($params->{institution});
+                    my $organization_id;
+                    unless (defined $organization) {
+                        $organization_id = $mimas_db->User->OrganizationAdaptor->store(-name       => $params->{institution},
+			                                                               -url        => $params->{institute_url},
+										       -valid      => 1,
+										       -country_id => $params->{country_id});
+                    } else {
+		        $organization_id = $organization->dbID;
+                    }
+                        
+			# check if organization attribute detail already exists
+			my $attr_detail = $mimas_db->Library->AttrDetailAdaptor->select_by_attrs_ci(-name         => $params->{institution},
+		                                                                                    -type         => 'value',
+											            -attribute_id => $named_attributes->{'Organization'}->dbID);
+                        unless (defined $attr_detail) {
+			    $mimas_db->Library->AttrDetailAdaptor->store(-name                 => $params->{institution},
+			                                                 -type                 => 'value',
+			                                                 -default              => 0,
+									 -base_conv_scalar     => undef,
+			                                                 -base_conv_factor     => undef,
+			                                                 -description          => undef,
+								         -link_id              => $organization_id,
+			                                                 -attr_detail_group_id => undef,
+                                                                         -mage_name            => undef,
+			                                                 -attribute_id         => $named_attributes->{'Organization'}->dbID);
+                        } else {
+			    $mimas_db->Library->AttrDetailAdaptor->update(-set        => [ -link_id        => $organization_id   ],
+			                                                  -qualifiers => [ -attr_detail_id => $attr_detail->dbID ]);
+			}
+		    
+		    my $lab_name = $params->{new_labname} || $edited_user->lab->name;
+                    $mimas_db->User->LabAdaptor->update(-set        => [ -name            => $lab_name,
+		                                                         -address         => $params->{address},
+								         -postcode        => $params->{postcode},
+								         -state           => $params->{state},
+								         -city            => $params->{city},
+								         -url             => $params->{lab_url},
+								         -pi_name         => $params->{pi_name},
+								         -pi_email        => $params->{pi_email},
+								         -organization_id => $organization_id      ],
+		                                        -qualifiers => [ -lab_id          => $edited_user->lab->dbID      ]);
+                    
+		    $attr_detail = $mimas_db->Library->AttrDetailAdaptor->select_by_attrs_ci(-name         => $edited_user->lab->name,  # look for old lab name
+		                                                                                -type         => 'value',
+											        -attribute_id => $named_attributes->{'Laboratory/Group Name'}->dbID);
+
+		    if ($attr_detail) {
+		    $mimas_db->Library->AttrDetailAdaptor->update(-set        => [ -name           => $lab_name          ],
+		                                                  -qualifiers => [ -attr_detail_id => $attr_detail->dbID ]);
+		    }
+		    else {#new lab
+			    $mimas_db->Library->AttrDetailAdaptor->store(-name                 => $lab_name,
+			                                                 -type                 => 'value',
+			                                                 -default              => 0,
+									 -base_conv_scalar     => undef,
+			                                                 -base_conv_factor     => undef,
+			                                                 -description          => undef,
+			                                                 -link_id              => $edited_user->lab->dbID,
+									 -attr_detail_group_id => undef,
+                                                                         -mage_name            => undef,
+			                                                 -attribute_id         => $named_attributes->{'Laboratory/Group Name'}->dbID);
+		    }
+		}
+	        
+	        $params->{password} = $params->{password} eq ('@' x 15)
+		                        ? $edited_user->password 
+	                                : &encrypt_password($params->{password});
+	        
+	        $mimas_db->User->UserAdaptor->update(-set        => [ -username    => $params->{usernme},
+		                                                      -password    => $params->{password},
+								      -first_name  => $params->{first_name},
+		                                                      -middle_name => $params->{middle_name},
+								      -last_name   => $params->{last_name},
+								      -position    => $params->{position},
+								      -email       => $params->{email},
+								      -phone       => $params->{phone},
+								      -fax         => $params->{fax},
+								      -title_id    => $params->{title_id},
+								      -lab_id      => $params->{lab_id},    ],
+		                                     -qualifiers => [ -user_id     => $edited_user->dbID           ]);
+                
+		# update "Sample Owner" detail for user if it exists
+	        my $attr_detail = $mimas_db->Library->AttrDetailAdaptor->select_by_attr_link_id(-link_id      => $edited_user->dbID,
+	                                                                                        -attribute_id => $named_attributes->{'Sample Owner'}->dbID);
+	        if (defined $attr_detail) {
+		    my $sample_owner_name = $params->{last_name} . ', ' . $params->{first_name} . 
+		                            ((defined $params->{middle_name} and $params->{middle_name} ne '') ? ' ' . $params->{middle_name} : '');
+		    
+		    $mimas_db->Library->AttrDetailAdaptor->update(-set        => [ -name           => $sample_owner_name ],
+		                                                  -qualifiers => [ -attr_detail_id => $attr_detail->dbID ]);
+		}
+
+		
+        if (defined $params->{groups} and $auth_user->is_admin) {
+            my @groups = split /\0/, $params->{groups};
+            $mimas_db->User->UserToGroupAdaptor->remove_all_by_userID($edited_user->dbID);
+            for my $group (@groups) {
+                $mimas_db->User->UserToGroupAdaptor->store(
+                    -user_id  => $edited_user->dbID,
+                    -group_id => $group,
+                );
+            }
+
+            $send_email = 1 if $edited_user->disabled;
+
+            # Enable User
+            $mimas_db->User->UserAdaptor->update(-set        => [ -disabled => 0           ],
+                -qualifiers => [ -user_id  => $edited_user->dbID ]);
+
+            # Enable Lab
+            $mimas_db->User->LabAdaptor->update(-set        => [ -valid  => 1                ],
+                -qualifiers => [ -lab_id => $edited_user->lab->dbID ]);
+
+            # Enable Organization
+            $mimas_db->User->OrganizationAdaptor->update(-set        => [ -valid           => 1 ],
+                                                         -qualifiers => [ -organization_id => $edited_user->lab->organization->dbID ]);
+
+            my $existing_org = $mimas_db->Library->AttrDetailAdaptor->select_by_attrs_ci(-name         => $edited_user->lab->organization->name,
+                                                                                         -type         => 'value',
+                                                                                         -attribute_id => $named_attributes->{'Organization'}->dbID);
+
+        }
+
+        if (defined $params->{facilities} and $auth_user->is_admin) {
+            my @facilities = split /\0/, $params->{facilities};
+            $mimas_db->User->UserToFacilityAdaptor->remove_all_by_userID($edited_user->dbID);
+            for my $facility (@facilities) {
+                $mimas_db->User->UserToFacilityAdaptor->store(
+                    -user_id  => $edited_user->dbID,
+                    -attr_detail_id => $facility,
+                );
+            }
+        }
+		
+		
+	        # commit to DB
+	        $mimas_db->commit();
+	    };
+	    
+	    unless ($@) {
+
+                if ($send_email) {
+                    send_email(
+                        'From'     => MIMAS_ADMIN_EMAIL_ADDRESS,
+                        'To'       => $edited_user->email,
+                        'Bcc'      => MIMAS_ADMIN_EMAIL_ADDRESS,
+                        'Subject'  => '[MIMAS] User Account Activated',
+                        'Data'     => $email_body,
+                    ) or die "Could not send user approved email: $!";
+                }
+
+	        # after processing POST redirect to appropriate place
+		if ($curation_mode) {
+		    print $mimas_web->cgi->redirect("$base/admin?page=users&session_id=${session_id}");
+		}
+		else {
+		    print $mimas_web->cgi->redirect("$base/user?page=home&session_id=${session_id}");
+		}
+	        exit;
+
+	    } else {
+	        push @errors, MIMAS_DB_ERROR_MSG;
+	        $mimas_db->warn("USER_INFO transaction aborted:\n$@");
+	    }
+        }
+    }
+    #
+    ## bad POST action
+    #
+    else {
+        push @errors, 'Invalid action!';
+    }
+}
+#
+## bad page request
+#
+elsif ($mimas_web->cgi->request_method ne 'GET') {
+    push @errors, 'Invalid page request!';
+}
+
+
+if (@errors) {
+    eval { $mimas_db->rollback() };
+    $mimas_web->error(@errors);
+}
+
+
+#
+## HTML GENERATION: do the page specific data object preparation, processing, and HTML page setup
+#
+my ($body, $jscript, $title, $onunload);
+
+if ($web_page eq 'home') {
+    # prepare HTML
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="page" value="$web_page">
+    HTML
+    
+    my $alerts_html;
+    if (defined $auth_user->alerts) {
+        my $alert_rows_html;
+        my $counter = 1;
+        my $num_alerts = scalar @{$auth_user->alerts};
+        # already sorted from newest time --> oldest time
+        for my $alert (@{$auth_user->alerts}) {
+            my $message = $alert->data->{message};
+	    my $time    = $alert->time;
+	    # cleanup extraneous time fields
+	    # $time =~ s/(\d{2}\.\d{2}\.\d{2})\.\d{6}/$1/;
+	    # $time =~ s/(\+|-)\d{2}:\d{2}//;
+	    
+	    my $time_html    = $mimas_web->cgi->escapeHTML($time);
+	    my $message_html = $mimas_web->cgi->escapeHTML($message);
+	    
+	    if ($alert->type eq 'SAMPLE DOWNLOAD') {
+	        my $filename  = $alert->data->{filename};
+	        $message_html = "$message_html&nbsp;&nbsp;<a class='downlink01' href='get_download?session_id=${session_id}&filename=${filename}'>&gt;&gt;Retrieve&lt;&lt;</a>";
+	    }
+	    
+	    my $td_class01 = $counter != $num_alerts ? 'cell01wmin' : 'cell03wmin';
+	    my $td_class02 = $counter != $num_alerts ? 'cell01wrap' : 'cell03wrap';
+	    my $td_class03 = $counter != $num_alerts ? 'cell02ctr'  : 'cell04ctr';
+	    
+	    $alert_rows_html .= <<"            HTML";
+	    <tr>
+	      <td class="$td_class01"><span class="nowrap">$time_html</span></td>
+	      <td class="$td_class02">$message_html</td>
+	      <td class="$td_class03"><input type="checkbox" id="remove_@{[$alert->dbID]}" name="remove_alerts" value="@{[$alert->dbID]}"></td>
+	    </tr>
+            HTML
+	    
+	    $counter++;
+        }
+        
+        $alerts_html = <<"        HTML";
+        <tr>
+          <td>
+            <form name="manage_alerts" method="post" action="$base/user" onSubmit="return checkmanagealerts(this)">
+              <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+                <tr><td class="tableheader01">Alerts &amp; Information</td></tr>
+                <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+                <tr>
+                  <td>
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+	                <td class="colheader01wmin">Time</td>
+                        <td class="colheader01">Message</td>
+                        <td class="colheader02ctrw10pct">Remove</td>
+                      </tr>
+		      $alert_rows_html
+                    </table>
+                  </td>
+                </tr>
+	        <tr><td class="submit"><input class="submitw115" type="submit" value="REMOVE SELECTED"></td></tr>
+                <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+              </table>
+              $hidden_html
+            </form>
+          </td>
+        </tr>
+        HTML
+    } else {
+        $alerts_html = <<"        HTML";
+        <tr>
+          <td>
+           Important information will be displayed here by MIMAS to alert you.
+          </td>
+        </tr>
+        <tr><td><img width="1" height="450" alt="" src="/images/spacer.gif"></td></tr>
+        HTML
+    }
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">Welcome @{[$mimas_web->cgi->escapeHTML($edited_user->first_name)]}</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    $alerts_html
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title    = "@{[$edited_user->first_name]} @{[$edited_user->last_name]} Home";
+    $onunload = '';
+}
+elsif ($web_page eq 'info') {
+
+    my $labs      = $mimas_db->User->LabAdaptor->select_all_valid();
+    my $countries = $mimas_db->User->CountryAdaptor->select_all();
+    my $titles    = $mimas_db->User->TitleAdaptor->select_all();
+
+    #if an administrator is reviewing a newly registered user from a new lab,
+    #make sure he can see the lab in the list, even if it's not validated yet.
+    $labs->{$edited_user->lab->dbID} = $edited_user->lab;
+    
+    my $username      = $edited_user->username;
+    my $password      = '@' x 15;
+    my $title_id      = defined $edited_user->title ? $edited_user->title->dbID : undef;
+    my $first_name    = $edited_user->first_name;
+    my $middle_name   = defined $edited_user->middle_name ? $edited_user->middle_name : '';
+    my $last_name     = $edited_user->last_name;
+    my $position      = $edited_user->position;
+    my $phone         = $edited_user->phone;
+    my $fax           = defined $edited_user->fax ? $edited_user->fax : '';
+    my $email         = $edited_user->email;
+    my $lab_id        = $edited_user->lab->dbID;
+    my $pi_name       = $edited_user->lab->pi_name;
+    my $pi_email      = $edited_user->lab->pi_email;
+    my $lab_url       = defined $edited_user->lab->url ? $edited_user->lab->url : '';
+    my $institution   = $edited_user->lab->organization->name;
+    my $institute_url = defined $edited_user->lab->organization->url ? $edited_user->lab->organization->url : '';
+    my $address       = $edited_user->lab->address;
+    my $postcode      = $edited_user->lab->postcode;
+    my $city          = $edited_user->lab->city;
+    my $state         = defined $edited_user->lab->state ? $edited_user->lab->state : '';
+    my $country_id    = $edited_user->lab->organization->country->dbID;
+    
+    ## create JavaScript object
+    my $lab_obj   = '{}';
+    if (defined $labs) {
+        $lab_obj = '{';
+        for my $lab_id (keys %{$labs}) {
+            $lab_obj .= " $lab_id: {";
+            for my $attr (keys %{$labs->{$lab_id}}) {
+	        # skip these lab attributes since they are not needed as is
+	        next if $attr =~ /^adaptor|dbID|organization_id|valid$/i;
+	        
+		my $value = $labs->{$lab_id}->$attr;
+		
+		# change some names
+		$attr = 'lab_url' if $attr eq 'url';
+		
+	        $value = '' unless defined $value;
+	        $value = escapeJS($value);
+	        $value =~ s/[ \t]+/ /g;
+	        $value =~ s/[\n\r\f]+/\\n/g;
+                $lab_obj .= " $attr: \"$value\",";
+            }
+	    # add organization fields
+	    my $value = $labs->{$lab_id}->organization->name;
+	    $value = '' unless defined $value;
+	    $value = escapeJS($value);
+	    $value =~ s/[ \t]+/ /g;
+	    $value =~ s/[\n\r\f]+/\\n/g;
+            $lab_obj .= " institution: \"$value\",";
+	    $value = $labs->{$lab_id}->organization->url;
+	    $value = '' unless defined $value;
+	    $value = escapeJS($value);
+	    $value =~ s/[ \t]+/ /g;
+	    $value =~ s/[\n\r\f]+/\\n/g;
+            $lab_obj .= " institute_url: \"$value\",";
+	    $value = $labs->{$lab_id}->organization->country->dbID;
+	    $value = '' unless defined $value;
+	    $value = escapeJS($value);
+	    $value =~ s/[ \t]+/ /g;
+	    $value =~ s/[\n\r\f]+/\\n/g;
+            $lab_obj .= " country_id: \"$value\",";
+	    
+            chop $lab_obj;
+            $lab_obj .= ' },';
+        }
+        chop $lab_obj;
+        $lab_obj .= ' }';
+    }
+    
+    my $hidden_html0 = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="edited_user" value="@{[$edited_user->dbID]}">
+    HTML
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="page" value="$web_page">
+    $hidden_html0
+    HTML
+    my $hidden_html2 = <<"    HTML";
+    <input type="hidden" name="page" value="reject_user">
+    $hidden_html0
+    HTML
+    
+    $_ = $mimas_web->cgi->escapeHTML($_) for $username, $password, $first_name,  $middle_name,   $last_name,
+                                             $position, $phone,    $fax,         $email,         $pi_name,
+					     $pi_email, $lab_url,  $institution, $institute_url,
+					     $address,  $postcode, $city,        $state;
+    
+    my $titles_html = "<option></option>";
+    for my $title (sort { lc($a->name) cmp lc($b->name) } values %{$titles}) {
+        my $selected   = (defined $title_id and $title_id == $title->dbID) ? 'selected' : '';
+        my $title_html = $mimas_web->cgi->escapeHTML($title->name);
+        $titles_html  .= "<option value='@{[$title->dbID]}' $selected>$title_html</option>";
+    }
+    
+    my $countries_html = "<option></option>";
+    for my $country (sort { lc($a->name) cmp lc($b->name) } values %{$countries}) {
+        my $selected     = (defined $country_id and $country_id == $country->dbID) ? 'selected' : '';
+        my $country_html = $mimas_web->cgi->escapeHTML($country->name);
+        $countries_html .= "<option value='@{[$country->dbID]}' $selected>$country_html</option>";
+    }
+    
+    my $labs_html = "<option class='italic'>Please select from laboratory list or NEW</option>";
+    for my $lab (sort { lc($a->name) cmp lc($b->name) } values %{$labs}) {
+        my $selected      = (defined $lab_id and $lab_id == $lab->dbID) ? 'selected' : '';
+        my $lab_name_html = $mimas_web->cgi->escapeHTML($lab->name);
+        my $new_lab_html = !$lab->valid ? " ***NEW LAB***" : ""; #in case of new user approval
+        $labs_html       .= "<option value='@{[$lab->dbID]}' $selected>$lab_name_html$new_lab_html</option>";
+    }
+    $labs_html .= "<option id='option_new_lab'>NEW...</option>";
+    
+    my $can_edit_lab = $edited_user->is_pi || $auth_user->is_admin ? 1 : 0;
+
+    my $pi_lab_id   = $can_edit_lab ? $edited_user->lab->dbID : 'null';
+    my $disabled    = $can_edit_lab ? ''               : 'disabled';
+    my $readonly    = $can_edit_lab ? ''               : 'readonly';
+    my $rename_html = $can_edit_lab ? "<img width='5' height='1' alt='' src='/images/spacer.gif'><input class='button01w50' type='button' name='renamebutton' value='RENAME' onClick='renamelab(this.form, labobj, $pi_lab_id)'>" : '';
+
+    my $groups_html;
+
+    if ($auth_user->is_admin) {
+
+    my $groups = $edited_user->groups;
+    my @valid_groups = grep {!$_->is_auto} values %$groups;
+    my $selected_groups_html = join "", map {"<option value='@{[$_->dbID]}'>@{[$_->name]}</option>"} @valid_groups;
+
+    my $all_groups = $mimas_db->User->GroupAdaptor->select_all;
+    my @valid_all_groups = grep {!$_->is_auto} values %$all_groups;
+    my $pick_groups_html = join "", map {"<option value='@{[$_->dbID]}'>@{[$_->name]}</option>"} grep {not exists $groups->{$_->dbID}} sort {$a->name cmp $b->name} @valid_all_groups;
+
+    my $facilities = $edited_user->facilities;
+    my $selected_facilities_html = join "", map {"<option value='@{[$_->dbID]}'>@{[$_->name]}</option>"} values %$facilities;
+
+    my $all_facilities = $mimas_db->Library->AttributeAdaptor->select_by_attr_name('Microarray Facility')->details;
+    my $pick_facilities_html = join "", map {"<option value='@{[$_->dbID]}'>@{[$_->name]}</option>"} grep {not exists $facilities->{$_->dbID}} sort {$a->name cmp $b->name} values %$all_facilities;
+
+
+
+    $groups_html = <<"                    HTML";
+                  <tr>
+                    <td class="cell01">Groups [admin]<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02nopad">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td class="cell03w50pct" rowspan="2"><select multiple class="w100pct" name="pick_groups" size="6">$pick_groups_html</select></td>
+                          <td class="cell01ctrwmin"><input class="button01w60" type="button" value="ADD &rarr;" onClick="checkselectmulti(this.form, 'pick_groups', 'groups')"></td>
+                          <td class="cell04w50pct" rowspan="2"><select multiple class="w100pct" name="groups" size="6">$selected_groups_html</select></td>
+                        </tr>
+                        <tr>
+                          <td class="cell03ctrwmin"><input class="button01w60" type="button" value="&larr; REMOVE" onClick="checkselectmulti(this.form, 'groups', 'pick_groups')"></td>
+                        </tr>
+                      </table>
+                    </td>
+	          </tr>
+                  <tr>
+                    <td class="cell03">Facilities [admin]<img width="3" height="1" alt="" src="/images/spacer.gif"></td>
+                    <td class="cell04nopad">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td class="cell03w50pct" rowspan="2"><select multiple class="w100pct" name="pick_facilities" size="6">$pick_facilities_html</select></td>
+                          <td class="cell01ctrwmin"><input class="button01w60" type="button" value="ADD &rarr;" onClick="checkselectmulti(this.form, 'pick_facilities', 'facilities')"></td>
+                          <td class="cell04w50pct" rowspan="2"><select multiple class="w100pct" name="facilities" size="6">$selected_facilities_html</select></td>
+                        </tr>
+                        <tr>
+                          <td class="cell03ctrwmin"><input class="button01w60" type="button" value="&larr; REMOVE" onClick="checkselectmulti(this.form, 'facilities', 'pick_facilities')"></td>
+                        </tr>
+                      </table>
+                    </td>
+	          </tr>
+                    HTML
+    }
+
+    my $is_groups = $auth_user->is_admin ? 1 : 0;
+    
+    my $reject_user_html = $curation_mode ? <<"    HTML" : "";
+        <form name="user_information" method="post" action="$base/user"  onsubmit=\"return confirm('Are you sure you want to reject the user registration and delete the submitted info from the database?\\nNote that the user will NOT receive any notification e-mail. Please get in contact with him if necessary.')\">
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+          <tr><td class="submit"><input class="submitw170 buttoncurate" type="submit" value="REJECT &amp; DELETE USER"></td></tr>
+          </table>
+          $hidden_html2
+          </form>
+    HTML
+
+    #We use 'usernme' instead of 'username' as element name in an attempt to thwart Firefox's auto-completion mechanism
+    $body = <<"    HTML";
+    <tr><td class="header01">Personal Information</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+        <form name="user_information" method="post" autocomplete="off" action="$base/user" onSubmit="return checkuserinfo(this, $is_groups)" onReset="if (confirm('Reset entire page and start over?')) location.replace('@{[$mimas_web->cgi->url(-absolute => 1, -query => 1)]}'); else return false">
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01"><img width="1" height="10" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr>
+	      <td>
+	        <table width="100%" cellpadding="0" cellspacing="0" border="0">
+	          <tr>
+	            <td class="cell01">Login/User Name<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+		    <td class="cell02">
+		      <input type="text" name="usernme" maxlength="15" value="$username">
+		      <img width="5" height="1" alt="" src="/images/spacer.gif"><span class="itnote">(max. 15 characters)</span>
+		    </td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Password<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02">
+		      <input type="password" name="password" value="$password">
+		      <img width="5" height="1" alt="" src="/images/spacer.gif"><span class="itnote">(min. 6 characters)</span>
+		    </td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Confim Password<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="password" name="confirm_pass" value="$password"></td>
+	          </tr>
+	          <tr>
+	            <td class="cell02" colspan="2"><img width="1" height="10" alt="" src="/images/spacer.gif"></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Title</td>
+		    <td class="cell02"><select name="title_id">$titles_html</select></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">First<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span>, Middle, Last Name<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+		    <td class="cell02">
+		      <input type="text" name="first_name" value="$first_name">
+		      <img width="1" height="1" alt="" src="/images/spacer.gif">
+		      <input type="text" name="middle_name" size="15" value="$middle_name">
+		      <img width="1" height="1" alt="" src="/images/spacer.gif">
+		      <input type="text" name="last_name" value="$last_name">
+		    </td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Position<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+		    <td class="cell02"><input type="text" name="position" size="60" value="$position"></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Phone Number<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+		    <td class="cell02"><input type="text" name="phone" size="25" value="$phone"></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Fax Number</td>
+	            <td class="cell02"><input type="text" name="fax" size="25" value="$fax"></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Email Address<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="text" name="email" size="40" value="$email"></td>
+	          </tr>
+		  <tr>
+	            <td class="cell02" colspan="2"><img width="1" height="10" alt="" src="/images/spacer.gif"></td>
+	          </tr>
+		  <tr>
+	            <td class="cell01">Laboratory/Group Name<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><select name="lab_id" onChange="checklab(this, labobj, $pi_lab_id)">$labs_html</select>$rename_html</td>
+	          </tr>
+		  <tr>
+	            <td class="cell01">Principal Investigator<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="text" name="pi_name" class="$disabled" size="40" value="$pi_name" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Principal Investigator Email<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="text" name="pi_email" class="$disabled" size="40" value="$pi_email" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Lab URL</td>
+	            <td class="cell02"><input type="text" name="lab_url" class="$disabled" size="60" value="$lab_url" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Institution<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="text" name="institution" class="$disabled" size="60" value="$institution" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Institute URL</td>
+	            <td class="cell02"><input type="text" name="institute_url" class="$disabled" size="60" value="$institute_url" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Address<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><textarea rows="4" cols="60" name="address" wrap="off" class="$disabled" $readonly>$address</textarea></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Postal Code<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="text" name="postcode" class="$disabled" size="20" value="$postcode" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">City<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><input type="text" name="city" class="$disabled" size="30" value="$city" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">State/Canton/Province</td>
+	            <td class="cell02"><input type="text" name="state" class="$disabled" size="30" value="$state" $readonly></td>
+	          </tr>
+	          <tr>
+	            <td class="cell01">Country<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+	            <td class="cell02"><select name="country_id" class="$disabled" $disabled>$countries_html</select></td>
+	          </tr>
+	            $groups_html
+	        </table>
+	      </td>
+	    </tr>
+	    <tr><td class="submit"><input class="submitw115" type="submit" value="UPDATE USER INFO"></td></tr>
+	    <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+          </table>
+          $hidden_html
+        </form>
+        $reject_user_html
+      </td>
+    </tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    var labobj = $lab_obj;
+    JSCRIPT
+    
+    $title    = 'Personal Information';
+    $onunload = '';
+}
+
+
+#
+## session processing
+#
+$mimas_web->session->{timestamp} = time;
+
+
+#
+## display HTML
+#
+print $mimas_web->cgi->header(-type          => 'text/html',
+	                      -charset       => 'utf-8',
+			      -encoding      => 'utf-8'), # -cache_control => 'no-store'),
+      
+      $mimas_web->cgi->start_html(-title     => "MIMAS -- $title",
+                                  -encoding  => 'utf-8',
+                                  -style     => {-src => ["/styles/mimas_01.css?session_id=$session_id", @css]},
+		                  -script    => [ {-src => "/js/mimas.js?session_id=$session_id"}, {-code => $jscript} ],
+				  -onUnload  => $onunload),
+      
+      $mimas_web->html->web_page(-template    => 'TEMPLATE_01',
+                                 -main_menu   => 'DEFAULT',
+		                 -detail_menu => 'USER',
+		                 -navbar      => 'LOGOUT',
+		                 -body        => $body,
+						 -user        => $auth_user,
+						 ),
+      
+      $mimas_web->cgi->end_html;
+
+
+#
+## store session
+#
+$mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+
+exit;
+

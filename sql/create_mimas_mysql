@@ -1,0 +1,85 @@
+#!/bin/sh
+
+# create_mimas
+# Master Shell Script to Create MIMAS Production Oracle Database
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+
+# Variables
+DB_SID="localhost"
+DBADMIN_USER="********"
+DBADMIN_PASS="********"
+
+MIMAS_USER="mimas"
+MIMAS_WEB_USER="mimas_web"
+MIMAS_READ_USER="mimas_read"
+MIMAS_PASS="*************"
+MIMAS_WEB_PASS="*************"
+MIMAS_READ_PASS="*************"
+
+
+{
+  # Create Users
+  echo
+  echo
+  echo "\/==================| CREATING $DB_SID USERS |==================\/"
+  echo
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "DROP DATABASE IF EXISTS mimas_web" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "create database mimas_web default character set 'utf8' default collate 'utf8_general_ci'" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "GRANT ALL ON mimas_web.* TO '$MIMAS_WEB_USER'@'localhost' WITH GRANT OPTION" || exit
+
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "DROP DATABASE IF EXISTS mimas" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "create database mimas default character set 'utf8' default collate 'utf8_general_ci'" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "GRANT ALL ON mimas.* TO '$MIMAS_USER'@'localhost' WITH GRANT OPTION" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "GRANT ALL ON mimas_web.* TO '$MIMAS_USER'@'localhost' WITH GRANT OPTION" || exit
+
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "SET PASSWORD FOR '$MIMAS_USER'@'localhost' = PASSWORD('$MIMAS_PASS')" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "SET PASSWORD FOR '$MIMAS_WEB_USER'@'localhost' = PASSWORD('$MIMAS_WEB_PASS')" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "SET PASSWORD FOR '$MIMAS_READ_USER'@'localhost' = PASSWORD('$MIMAS_READ_PASS')" || exit
+  mysql -h $DB_SID -u $DBADMIN_USER -p$DBADMIN_PASS -e "FLUSH PRIVILEGES" || exit
+  
+  
+  # Create Tables & Privileges
+  echo
+  echo
+  echo "\/==================| CREATING $DB_SID TABLES & PRIVILEGES |==================\/"
+  echo
+  mysql -h $DB_SID -u $MIMAS_USER -p$MIMAS_PASS mimas < create_mimas_tables_privs.my.sql || exit
+  mysql -h $DB_SID -u $MIMAS_WEB_USER -p$MIMAS_WEB_PASS mimas_web < create_mimasweb_tables_privs.my.sql || exit
+  
+  
+  # Create Constraints & Indexes
+  echo
+  echo
+  echo
+  echo "\/==================| CREATING $DB_SID CONSTRAINTS & INDEXES |==================\/"
+  echo
+  mysql -h $DB_SID -u $MIMAS_USER -p$MIMAS_PASS mimas < create_mimas_consts_idxs.my.sql || exit
+  
+  
+  # Analyze Database
+  echo
+  echo
+  echo
+  echo "\/==================| ANALYZING $DB_SID |==================\/"
+  echo
+  mysqlcheck -a -h $DB_SID -u $MIMAS_USER -p$MIMAS_PASS mimas || exit
+  mysqlcheck -a -h $DB_SID -u $MIMAS_WEB_USER -p$MIMAS_WEB_PASS mimas_web || exit
+  
+  echo
+  echo
+  echo
+  echo "$DB_SID Creation Complete"
+  echo
+  echo
+} > $0.log
+
+chmod 600 $0.log
+echo "Output went to $0.log"
+

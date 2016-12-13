@@ -1,0 +1,14 @@
+
+CHANGE HISTORY
+--------------
+
+1.0     Version published Hermida et al, BMC Bioinformatics. 2006 Apr 5;7:190.
+
+2.0     Version installed onto the Vital-IT platform.
+        Support data sharing with access control lists.
+        Added export to ArrayExpress via tab2mage.
+        Added support for yeast tiling arrays.
+
+2.1     Added support for multi-sample files (Illumina).     
+
+3.0     Added support for more Affymetrix array types and UHTS data (GFF3).

@@ -1,0 +1,954 @@
+#!/usr/bin/perl
+
+# mimas_job_execd
+# MIMAS External Job Queue Execution Daemon
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings FATAL => 'all';
+use FindBin;
+use lib "$FindBin::Bin/../libs";
+use sigtrap qw(handler sig_handler normal-signals error-signals ALRM);
+use Archive::Zip;
+use File::Basename qw(fileparse dirname);
+use File::Temp qw(tempfile);
+use File::Path qw(rmtree);
+use MIMAS::DB;
+use MIMAS::Consts;
+use MIMAS::Utils;
+use MIMAS::SampleFileParser;
+use IO::File;
+use IO::Dir;
+use HTML::Entities qw(encode_entities);
+
+my %format_order = qw(
+TXT 1
+RMA 2
+GMA 3
+);
+my $SPREADSHEET_NAME = 'spreadsheet';
+
+sub sig_handler {
+    die "\nMIMAS Job Execution Daemon exited [", scalar localtime, "]\n\n";
+}
+
+use constant SLEEP_INTERVAL => 15;   # in seconds
+
+# die if I am already running
+die "\nMIMAS Job Execution Daemon already running!\n\n" if `ps -eo cmd | grep -v grep | grep -c $0` > 1;
+
+# Unbuffer error and output streams (make sure STDOUT is last so that it remains the default filehandle)
+select(STDERR); $| = 1;
+select(STDOUT); $| = 1;
+
+# Set up Environment
+&set_env();
+
+print
+"
+#----------------------------------------------------------------------------------------------------------------------#
+# MIMAS Job Queue Execution Daemon v2 [", scalar localtime, "]\n\n\n";
+
+
+# Create MIMAS Database object
+print "Connecting to MIMAS...";
+my $mimas_db = MIMAS::DB->new(-service => 'ADMIN');
+print " done!\n";
+
+while (1) {
+    # Check to see if any jobs are in the queue
+    my $jobs = $mimas_db->Web->JobAdaptor->select_all();
+    if (defined $jobs) {
+	# already sorted from oldest request time --> newest request time
+        for my $job (@{$jobs}) {
+            print "\nProcessing Job [ID: @{[$job->dbID]}] [User: @{[$job->user->username]}]\n";
+
+	    my $checkDir = newTempDir;
+
+            eval {
+                if ($job->type eq 'SAMPLE DOWNLOAD') {
+	            print "\tJob Type: Sample Download\n";
+		    my $download_sample_ids = $job->data->{sample_ids};
+                    create_archive($mimas_db, $job->user, $download_sample_ids, $checkDir);
+                }
+	        
+	        print "\tRemoving job from queue\n";
+                $mimas_db->Web->JobAdaptor->remove_by_dbID($job->dbID);
+	        
+	        # Commit to DB
+	        print "\tCommitting MIMAS database transaction\n";
+	        $mimas_db->commit();
+            };
+            
+            if ($@) {
+                print "\n\tJob execution failed!\n\t$@\n\tMIMAS Database rollback issued\n";
+	        eval { $mimas_db->rollback() };
+		print "\tAborted Job [ID: @{[$job->dbID]}]\n\n";
+            } else {
+	        print "\tSuccessfully processed Job [ID: @{[$job->dbID]}]\n\n";
+	    }
+
+	    rmtree($checkDir);
+        }
+    } else {
+        print "\nNo jobs are queued [", scalar localtime, "]\n\n";
+    }
+    
+    sleep SLEEP_INTERVAL;
+}
+
+exit 0;
+
+=for nobody
+
+About compact_unit:
+From:   Eleanor Williams (miamexpress@ebi.ac.uk) 
+Sent:   Monday, August 04, 2008 1:14:26 PM 
+To:     jmaxmoore
+I also changed the two columns FactorValue[Age]  and FactorValue[TimeUnit] to
+just FactorValue[Age(months)].  The BioMaterialCharacteristics do have be
+BioMaterialCharacteristics[Age] BioMaterialCharacteristics[TimeUnit] (don't ask
+me why there is this difference!).
+
+=cut
+sub makeMGED {
+    my ($sample_attr_by_name, $v, $dest, $mage_category, $compact_unit) = @_;
+    my $attribute = $v->{attribute};
+    my $att_name = $attribute->name;
+    my $mged_name = $attribute->mged_name || "???" . $att_name . "???";
+    if ($att_name eq 'Cell Type/Targeted Cell Type') {
+        my $purity = $sample_attr_by_name->{'Sample Material Type'};
+        my $purity_value = defined($purity) ? $purity->{value} : undef;
+
+        if (!defined($purity_value) or $purity_value eq 'unknown' or $purity_value eq 'purified cell type') {
+            $mged_name = 'CellType';
+        }
+        else {
+            $mged_name = 'TargetedCellType';
+        }
+    }
+
+    my $mged_subkey = 'value';
+
+    if ($att_name eq 'Min Organism Age') {
+        $mged_subkey = 'min';
+    }
+    elsif ($att_name eq 'Max Organism Age') {
+        $mged_subkey = 'max';
+    }
+
+    my $unit_column_name;
+    my $unit_column_value;
+    my $value = $v->{value};
+    if (my $unit = $v->{unit}) {
+        if ($mged_name eq 'Age') {
+            if (!$compact_unit) {
+                $unit_column_name = $mage_category . "[TimeUnit]";
+                $unit_column_value = $v->{unit};
+            }
+            else {
+                $mged_name .= "($unit)";
+            }
+        }
+        else {
+            $value .= " $unit";
+        }
+    }
+
+    #format is e.g. 'BioMaterialCharacteristics[Organism]'
+    my $mged_key = $mage_category . "[$mged_name]";
+    if (exists $dest->{$mged_key}{$mged_subkey}) {
+        die "ERROR: tried to set two values for $mged_key->$mged_subkey";
+    }
+    $dest->{$mged_key}{$mged_subkey} = $value;
+
+    if ($unit_column_name) {
+        $dest->{$unit_column_name}{value} = $unit_column_value;
+    }
+}
+
+sub clean_csv {
+    my $text = shift;
+
+    # Encode control chars, high bit chars and '<', '&', '>', '"'
+    my $unsafe_chars = '^\n\r\t !\#\$%\'-;=?-~';
+
+    my $text2 = encode_entities($text, $unsafe_chars);
+
+    $text2 =~ s/\t/ /g;
+    $text2 =~ s/[\r\n]+/<br>/g;
+
+    return $text2;
+}
+
+sub generation_tab2mage_file {
+    my ($user, $samples) = @_;
+
+    my (@exp, %pro, %hyb, %hyb_files);
+
+    my %experiments;
+    for my $sample (values %$samples) {
+        my $experiment = $sample->experiment;
+        $experiments{$experiment->dbID} = $experiment;
+    }
+
+    my (@experiments) = map {$experiments{$_}} sort {$a cmp $b} keys %experiments;
+
+    my %quality_controls; #MGED Ontology QualityControlDescriptionType
+    my %experiment_design_types; #MGED Ontology ExperimentDesignType
+    my %experiment_descriptions; #free text
+    my %experiment_names; #free text
+    my %experiment_authors; #free text
+
+    my %all_exp_factors;
+
+    for my $experiment (@experiments) {
+        $experiment_names{$experiment->name}++;
+        for my $ea (values %{$experiment->attributes}) {
+            my $att = $ea->attribute;
+            my $att_name = $att->name;
+            if ($att_name eq 'Replicate Type') {
+                my $rt = $ea->detail->mage_name;
+                if (defined $rt) {
+                    $quality_controls{$rt}++;
+                }
+            }
+            if ($att_name eq 'Experiment Design Type') {
+                my $mage_name = $ea->detail->mage_name;
+                if ($mage_name) {
+                    $experiment_design_types{$mage_name}++; #MGED Ontology ExperimentDesignType
+                }
+            }
+            if ($att_name eq 'Experimental Goals/Description') {
+                my $rt = $ea->char_value;
+                $experiment_descriptions{$rt}++;
+            }
+            if ($att_name eq 'Author(s)') {
+                my $rt = $ea->char_value;
+                $experiment_authors{$rt}++;
+            }
+        }
+
+        for my $factor_id (keys %{$experiment->factors}) {
+            $all_exp_factors{$factor_id}++;
+        }
+    }
+
+    SAMPLE:
+    for my $sample (values %{$samples}) {
+        for my $sa (values %{$sample->attributes}) {
+            next unless $sa->attribute->name eq 'Spike Target Element';
+            $quality_controls{'spike_quality_control'} = 1;
+            last SAMPLE;
+        }
+    }
+
+    use POSIX qw(strftime);
+    my $date = POSIX::strftime("%G-%m-%d", localtime(time)); # YYYY-MM-DD (ArrayExpress required format)
+
+    #ArrayExpress submissions can be assigned a release date up to 1 year (31556926 seconds)
+    #later. That date can be postponed one month before it expires.
+    #Of course the data can also be released at any time before, upon submitter's request.
+    my $date2 = POSIX::strftime("%G-%m-%d", localtime(time+31556926)); 
+
+    push @exp, ["Experiment section"];
+    push @exp, ["domain", "mimas.vital-it.ch"];
+    push @exp, ["accession", "assigned by ArrayExpress"];
+    push @exp, ["quality_control", join(", ", sort keys %quality_controls)]; #IMPORTANT: comma-separated
+    push @exp, ["experiment_design_type", join(", ", sort keys %experiment_design_types)]; #IMPORTANT: comma-separated
+    push @exp, ["name", join("; ", sort keys %experiment_names)]; #let user reconcile names if different
+    push @exp, ["description", join("; ", sort keys %experiment_descriptions)]; #let user reconcile names if different
+    push @exp, ["release_date", $date2];
+    push @exp, ["submission_date", $date];
+    push @exp, ["investigator", join("; ", sort keys %experiment_authors)]; #let user reconcile names if different
+#    push @exp, ["investigator_email", ...];
+    push @exp, ["submitter", $user->full_name];
+    push @exp, ["submitter_email", $user->email];
+    push @exp, ["organization", $user->lab->organization->name];
+    push @exp, ["address", $user->lab->full_address];
+    push @exp, ["publication_title"];
+    push @exp, ["authors"];
+    push @exp, ["journal"];
+    push @exp, ["volume"];
+    push @exp, ["issue"];
+    push @exp, ["pages"];
+    push @exp, ["year"];
+
+    my $pro_n;
+    my %sample2protocol;
+    my %seen_protocol;
+    for my $sample (sort sort_sample values %{$samples}) {
+        my @protocols = getProtocols($samples, $sample);
+
+        for my $protocol (@protocols) {
+
+            my ($mage_category, $type, $text, $name, $parameters_string, $parameters) = @$protocol;
+
+            my $unique_signature = join "\0", $mage_category, $type, $text, $name, $parameters_string;
+
+            my $protocol_acc;
+            unless ($protocol_acc = $seen_protocol{$unique_signature}) {
+                $pro_n++;
+                $protocol_acc = "P-EXML-$pro_n";
+                $pro{$protocol_acc} = $protocol;
+            }
+            $seen_protocol{$unique_signature} = $protocol_acc;
+
+            push @{$sample2protocol{$sample->dbID}}, [$protocol_acc, $protocol];
+        }
+    }
+
+
+    my %seen_identifier;
+
+    for my $sample (sort sort_sample values %{$samples}) {
+        my $id = $sample->dbID;
+
+        $hyb{$id} = orderedHash;
+
+        my $name = $sample->name;
+        my $sample_attr_by_name = get_attr_by_name($samples, $sample, 0);
+
+	my $hybridization_name = $name; #default
+        for my $sample_to_file (sort {
+                ($format_order{$a->format} || -1) cmp ($format_order{$b->format} || -1)
+                || $a->format cmp $a->format
+            } values %{$sample->sample_to_files}) {
+            my $sample_file = $sample_to_file->sample_file;
+            my $format = $sample_file->format;
+            my $parser = new MIMAS::SampleFileParser(-format => $sample_file->format);
+            my $type = $parser->is_normalized() ? 'normalized' : 'raw';
+	    $hybridization_name = $sample_to_file->hybridization_name if $type eq 'raw'; #override default
+            push @{$hyb_files{$type}{$id}}, $sample_file->file_name;
+        }
+
+        if ($sample->array->technology->name eq 'GeneChip') {
+            $hyb{$id}{'File[cdf]'}{value} = $sample->array->design_name . ".cdf";
+        }
+
+        my $dye = $sample_attr_by_name->{'Dye'};
+        if ($dye) { #may be unset
+            $hyb{$id}{'Dye'}{value} = 'biotin';
+        }
+
+        $hyb{$id}{'Array[accession]'}{value} = $sample->array->arrayexpress_accession || "???";
+
+	#required for Illumina files; we simply add it for all experiments
+        $hyb{$id}{'Hybridization'}{value} = $hybridization_name;
+
+        my $prot = $sample2protocol{$id} || [];
+        my %all_parameters;
+        for my $protocol_p (@$prot) {
+            my ($protocol_acc, $protocol) = @$protocol_p;
+            my ($mage_category, $type, $text, $name, $parameters_string, $parameters) = @$protocol;
+
+            $hyb{$id}{"Protocol[$mage_category]"}{value} = $protocol_acc;
+
+            while (my ($att_name, $v) = each %$parameters) {
+                $all_parameters{$att_name} = $v;
+            }
+        }
+
+
+        my $nuc_type = $sample_attr_by_name->{'Nucleic Acid Type'};
+        my $extract_material;
+        if ($nuc_type) { #may be unset
+            $extract_material = $nuc_type->{value} #MGED Ontology MaterialType
+                or die "Unknown value for 'Nucleic Acid Type': '$nuc_type->{value}'";
+        }
+
+        my $bio_source_material = #MGED Ontology MaterialType
+            $sample_attr_by_name->{'Organ/Organism Part'} ? 'organism_part' :
+            'whole_organism';
+
+        my $identifier = $sample_attr_by_name->{'Individual Organism or Pool Identifier'};
+
+        if (!$identifier) {
+            #automatically generate a unique identifier for the bio sample base
+            #on organism name, strain, etc.
+            my $organism =
+            join " ",
+            map {$_->{value}}
+            grep {$_}
+            (
+                $sample_attr_by_name->{'Organism'},
+                $sample_attr_by_name->{'Sex/Mating Type'},
+                $sample_attr_by_name->{'Organism Developmental Stage'},
+                $sample_attr_by_name->{'Strain/Line/Cultivar'},
+                $sample_attr_by_name->{'Cell Line'},
+            );
+            ;
+            my $id = ++$seen_identifier{$organism};
+            $identifier = "$organism $id";
+        }
+        else {
+            $identifier = $identifier->{value};
+            $seen_identifier{$identifier}++;
+        }
+
+        $hyb{$id}{'BioSource'}{value} = $identifier;
+        $hyb{$id}{'BioSourceMaterial'}{value} = $bio_source_material;
+ #       $hyb{$id}{'SampleMaterial'}{value} = 
+        $hyb{$id}{'ExtractMaterial'}{value} = $extract_material if defined $extract_material;
+#        $hyb{$id}{'LabeledExtractMaterial'}{value} = 
+
+        for my $param_attr (sort by_group_order_then_order_then_name map {$_->{attribute}} values %all_parameters) {
+            my $param_attr_name = $param_attr->name;
+            my $att = $sample_attr_by_name->{$param_attr_name} or die "Missing attribute '$param_attr_name'";
+            $hyb{$id}{"Parameter[$param_attr_name]"}{value} = $att->{value};
+        }
+
+        for my $att_name (sort keys %$sample_attr_by_name) {
+            my $v = $sample_attr_by_name->{$att_name};
+            my $attribute = $v->{attribute};
+            next unless exists $all_exp_factors{$attribute->dbID};
+            makeMGED($sample_attr_by_name, $v, $hyb{$id}, 'FactorValue', 1);
+        }
+
+        for my $att_name (sort keys %$sample_attr_by_name) {
+            my $v = $sample_attr_by_name->{$att_name};
+            my $attribute = $v->{attribute};
+            my $mage_category = $attribute->mage_category;
+            if (defined($mage_category) and $mage_category eq 'BioMaterialCharacteristics') {
+                makeMGED($sample_attr_by_name, $v, $hyb{$id}, $mage_category, 0);
+            }
+        }
+
+#        $hyb{$id}{'BioMaterialCharacteristics[your_characteristic]'}{value} = values for header here
+    }
+
+    my $tab_file = "";
+
+    for my $exp (@exp) {
+        $tab_file .= join ("\t", map {clean_csv($_)} @$exp) . "\n";
+    }
+
+    $tab_file .= "\n" . "Protocol section\n";
+    $tab_file .= join ("\t", "accession", "type", "text", "name", "parameters") . "\n";
+    for my $pro (sort keys %pro) {
+        my ($mage_category, $type, $text, $name, $parameters_string, $parameters) = @{$pro{$pro}};
+        $tab_file .= join ("\t", $pro, map {clean_csv($_)} ($type, $text, $name, $parameters_string) ) . "\n";
+    }
+
+    $tab_file .= "\n" . "Hybridization section\n";
+
+    #get all keys in their correct order
+    my $hyb_keys = orderedHash;
+    #%hyb is a hash of Ordered Hashes
+    %$hyb_keys = map {($_, 1)} map {keys %$_} values %hyb;
+    #%$hyb_keys is an Ordered Hash
+    my @hyb_keys = keys %$hyb_keys;
+
+    my @file_keys;
+    push @file_keys, 'File[raw]' if $hyb_files{raw};
+    push @file_keys, 'File[normalized]' if $hyb_files{normalized};
+
+    $tab_file .= join ("\t", @file_keys, @hyb_keys) . "\n";
+
+    for my $sample (sort sort_sample values %{$samples}) {
+        my $id = $sample->dbID;
+
+        my $raw_file;
+
+        my $raw_files_p = $hyb_files{raw} ? $hyb_files{raw}{$id} : undef;
+        if ($raw_files_p) {
+            @$raw_files_p == 1 or die "Tried to set 2 raw files for sample " . $sample->name;
+            ($raw_file) = @$raw_files_p;
+        }
+
+        my $norm_files_p = $hyb_files{normalized}{$id};
+        my @norm_files = $norm_files_p ? @$norm_files_p : (undef);
+
+        for my $norm_file (@norm_files) {
+
+            my $hyb1 = $hyb{$id};
+
+            my @tab_line;
+            my $seen_value;
+
+            push @tab_line, $raw_file || "-" if $hyb_files{raw};
+
+            if (defined $norm_file) {
+                push @tab_line, $norm_file;
+            }
+
+            for my $key (@hyb_keys) {
+                my $v = $hyb1->{$key};
+                my $value = $v
+                    ?  exists $v->{value}
+                        ?  $v->{value}
+                        : exists $v->{min} && exists $v->{max}
+                            ?  "$v->{min} to $v->{max}"
+                            : "???"
+                    : ""; #empty field when a sample misses an attribute that another sample has
+
+                if ($value eq "" and $key =~ /^FactorValue\b/) {
+                    $value = "none";
+                }
+
+                push @tab_line, $value;
+            }
+            $tab_file .= join ("\t", map {clean_csv($_)} @tab_line) . "\n";
+
+        }
+    }
+
+    return $tab_file;
+}
+
+
+sub get_attr_by_name {
+    my ($samples, $sample, $reconcile_units) = @_;
+
+    my $sample_attr_by_name = orderedHash;
+
+    #get all units for numeric factors
+    my %min_units;
+    if ($reconcile_units) {
+        my %seen_units;
+        for my $sample1 (values %$samples) {
+            for my $sa (values %{$sample1->attributes}) {
+                my $att = $sa->attribute;
+                next unless $att->is_numeric;
+                my $att_detail = $sa->detail;
+                next unless $att_detail;
+
+                #Distinct attributes mapped to the same MGED term must have the same unit.
+                #E.g. (only instance known so far) 'Min Organism Age' and 'Max Organism Age'
+                my $seen_units_key = $att->mged_name || $att->name;
+
+                $seen_units{$seen_units_key}{$att_detail->base_conv_factor} = $att_detail;
+            }
+        }
+        #NB: ambiguous if two values have the same base_conv_factor!!!
+        %min_units = map {my @k = sort {$a <=> $b} keys %{$seen_units{$_}}; ($_, $seen_units{$_}{$k[0]})} keys %seen_units;
+    }
+
+    for my $sa (sort by_attr_info values %{$sample->attributes}) {
+        my $att = $sa->attribute;
+        my $att_detail = $sa->detail;
+        my $value = $att->is_numeric ? $sa->numeric_value : $sa->char_value;
+        my $unit;
+        if ($att->is_numeric and $att_detail) {
+            my $unit_detail = $att_detail;
+            if ($reconcile_units) {
+                my $seen_units_key = $att->mged_name || $att->name;
+                $unit_detail = $min_units{$seen_units_key};
+                if ($att_detail->dbID ne $unit_detail->dbID) {
+                    $value = ($value + $att_detail ->base_conv_scalar) * $att_detail ->base_conv_factor;
+                    $value = ($value / $unit_detail->base_conv_factor) - $unit_detail->base_conv_scalar;
+                }
+            }
+            $unit = $unit_detail->mage_name || $unit_detail->name;
+        }
+        if (!defined($value) and defined $att_detail) {
+            $value = $att_detail->mage_name || $att_detail->name;
+            $unit = undef;
+        }
+
+        if (exists $sample_attr_by_name->{$att->name}) {
+            $sample_attr_by_name->{$att->name}->{value} .= ", $value";
+        }
+        else {
+
+            $sample_attr_by_name->{$att->name} = {
+                'is_numeric' => $att->is_numeric,
+                'value' => $value,
+                'unit' => $unit,
+                'attribute' => $att,
+            };
+        }
+    }
+    return $sample_attr_by_name;
+}
+
+
+sub getProtocols {
+    my ($samples, $sample) = @_;
+    my @protocols;
+    my $sample_attr_by_name = get_attr_by_name($samples, $sample, 1);
+
+    my @mage_protocols = (
+        ['grow',           'grow'],
+        ['treatment',      'specified_biomaterial_action'],
+        ['extraction',     'nucleic_acid_extraction'],
+        ['labeling',       'labeling'],
+        ['hybridization',  'hybridization'],
+        ['scanning',       'image_acquisition'],
+        ['image_analysis', 'feature_extraction'],
+        ['normalization',  'bioassay_data_transformation'],
+    );
+    my %mage_category2protocol_type = map {($_->[0], $_->[1])} @mage_protocols;
+
+    my (%seen_cat, %values, %parameters);
+    while (my ($attr, $v) = each %$sample_attr_by_name) {
+        my $attribute = $v->{attribute};
+        my $att_name = $attribute->name;
+        my $mage_category = $attribute->mage_category;
+        my $mged_name = $attribute->mged_name;
+
+        if (defined($mage_category) and my $protocol_type = $mage_category2protocol_type{$mage_category}) {
+            $seen_cat{$mage_category} = 1;
+            if ($v->{is_numeric} and $v->{unit}) {
+                $parameters{$mage_category}{$attribute->name} = $v;
+            }
+            else {
+                push @{$values{$mage_category}}, "$att_name: $v->{value}";
+            }
+        }
+
+    }
+
+    for my $p_protocol (@mage_protocols) { 
+        my ($mage_category, $protocol_type) = @$p_protocol;
+        next unless $seen_cat{$mage_category};
+        my $values = join " ; ", @{$values{$mage_category}};
+        my $parameters = $parameters{$mage_category};
+        my $parameters_string = join " ; ", map {"$_ ($parameters->{$_}->{unit})"} sort keys %$parameters;
+        push @protocols, [$mage_category, $protocol_type, $values, $mage_category . ' protocol', $parameters_string, $parameters];
+    }
+
+    return @protocols;
+}
+
+
+
+sub create_archive {
+    my ($mimas_db, $user, $download_sample_ids, $checkDir) = @_;
+
+    my $archive_type = 'ZIP';
+
+    my @files_to_zip_ascii;
+    my @files_to_zip_binary;
+
+    warn "\nProcessing Job \n";
+    warn "\tJob Type: Sample Download\n";
+
+    # Get sample objects and build sample attributes data structure
+    warn "\tObtaining sample objects and building sample attributes data structure\n";
+    my ($samples);
+    my $err_filename = "errors.txt";
+    my $err_filepath = "$checkDir/$err_filename";
+    my $err_fileh = new IO::File $err_filepath, "w" or die "Cannot create $err_filepath: $!";
+    for my $sample_id (@$download_sample_ids) {
+        my $sample = $mimas_db->Upload->SampleAdaptor->select_by_dbID($sample_id);
+        unless ($sample) {
+                warn "No such sample_id $sample_id";
+                print $err_fileh "No such sample_id $sample_id";
+                next;
+        }
+        $samples->{$sample_id} = $sample;
+    }
+
+
+    close $err_fileh or die "Error writing to $err_filepath: $!"; #may be disk full
+    if (-s $err_filepath) {
+        warn "\tAdding $err_filename to ZIP object\n";
+        push @files_to_zip_ascii, $err_filename;
+    }
+
+    my $SUMMARY_FILE = 0;
+    my %all_exps;
+    for my $sample (values %$samples) {
+        $all_exps{$sample->experiment->dbID} = $sample->experiment;
+    }
+    EXP:
+    for my $experiment (values %all_exps) {
+        for my $factor (values %{$experiment->factors}) {
+            if ($factor->name eq 'time') {
+                $SUMMARY_FILE = 1;
+                last EXP;
+            }
+        }
+    }
+    if ($SUMMARY_FILE) {
+            my $filename = "dataframe.txt";
+            warn "\tAdding $filename to ZIP object\n";
+            my $filepath = "$checkDir/$filename";
+            my $fileh = new IO::File $filepath, "w" or die "Cannot create $filepath: $!";
+            binmode $fileh, ":utf8";
+            generation_summary_file($samples, $fileh);
+            close $fileh;
+            push @files_to_zip_ascii, $filename;
+    }
+
+    my $tab2mage_file;
+    my $tab2mage_err;
+    if (%$samples) {
+            warn "\tGenerating tab2mage file\n";
+            $tab2mage_file = eval { generation_tab2mage_file($user, $samples);};
+            $tab2mage_err = $@;
+    }
+
+
+    # Get data files and create compressed archive
+    my $dest_filespec;
+    my $tempfile_template = "@{[$user->dbID]}_XXXXXXXXXX";
+
+    if ($archive_type eq 'ZIP') {
+        warn "\tArchive Format: ZIP\n";
+        warn "\tCreating in-memory ZIP object\n";
+
+        mkdir "$checkDir/FILES" or die "Cannot mkdir $checkDir/FILES: $!";
+
+
+        my %seen_files;
+        for my $sample (values %{$samples}) {
+            warn "\tObtaining data files from MIMAS Repository [Sample ID: @{[$sample->dbID]}]\n";
+            my $sample_attributes = $sample->attributes;
+            my $sample_name = $sample->name;
+            my $sample_files = $mimas_db->Upload->SampleFileAdaptor->select_all_by_sampleID($sample->dbID);
+            for my $sample_file (values %{$sample_files}) {
+                next if $seen_files{$sample_file->dbID}++;
+                my $format = $sample_file->format;
+                my $filename = $sample_file->file_name;
+                die "Invalid file name" if $filename =~ m![\\/]|\.\.!;
+                warn "\tAdding $filename to ZIP object\n";
+                my $filepath = "$checkDir/FILES/$filename";
+                my $fileh = new IO::File $filepath, "w" or die "Cannot create $filepath: $!";
+
+                my $contents_ptr = $sample_file->contents_ptr;
+                print $fileh $$contents_ptr;
+                undef $contents_ptr;
+
+                close $fileh or die "Error writing to $filepath: $!"; #may be disk full
+                push @files_to_zip_binary, "FILES/$filename";
+            }
+        }
+
+        if ($tab2mage_file) {
+            my $filename = "$SPREADSHEET_NAME.txt";
+            warn "\tAdding $filename to ZIP object\n";
+            my $filepath = "$checkDir/$filename";
+            my $fileh = new IO::File $filepath, "w" or die "Cannot create $filepath: $!";
+	    binmode $fileh, ":utf8";
+            print $fileh $tab2mage_file;
+            close $fileh or die "Error writing to $filepath: $!"; #may be disk full
+            push @files_to_zip_ascii, $filename;
+
+            if (MIMAS_PATH_PERL && MIMAS_PATH_TAB2MAGE) {
+                warn "\tRunning tab2mage checker\n";
+                chdir $checkDir or die "Cannot chdir $checkDir: $!";
+
+                my $dotpath = MIMAS_PATH_DOT ? dirname(MIMAS_PATH_DOT) : "";
+
+                #PATH= is for 'dot' (run by expt_check.pl)
+                my $cmd = "PATH=$dotpath @{[MIMAS_PATH_PERL]} -I @{[MIMAS_PATH_TAB2MAGE]}/lib @{[MIMAS_PATH_TAB2MAGE]}/bin/expt_check.pl -c -d FILES -e $filepath -s > $checkDir/000_exec.log 2>&1";
+                system $cmd; #ignore errors (logged anyway)
+
+                my $log;
+                my $dir = new IO::Dir $checkDir or die "Cannot open $checkDir: $!";
+                my @logfiles;
+                while (my $file = $dir->read) {
+                    next unless $file =~ /\.log$/;
+                    push @logfiles, "$checkDir/$file";
+                }
+                for my $file (sort @logfiles) {
+                    my $logh = new IO::File $file or die "Cannot open $file: $!";
+                    local $/ = \1000000; #protection against huge files
+                    $log .= <$logh>;
+                }
+
+                {
+                    my $filename = "tab2mage_log.txt";
+                    warn "\tAdding $filename to ZIP object\n";
+                    my $filepath = "$checkDir/$filename";
+                    my $fileh = new IO::File $filepath, "w" or die "Cannot create $filepath: $!";
+                    print $fileh $log;
+                    close $fileh or die "Error writing to $filepath: $!"; #may be disk full
+                    push @files_to_zip_ascii, $filename;
+                }
+
+                my $img = "$checkDir/$SPREADSHEET_NAME.png";
+                if (-e $img) {
+                    push @files_to_zip_binary, "$SPREADSHEET_NAME.png";
+                }
+            }
+
+        }
+
+        if ($tab2mage_err) {
+            my $filename = "tab2mage_error.txt";
+            warn "\tAdding $filename to ZIP object\n";
+            my $filepath = "$checkDir/$filename";
+            my $fileh = new IO::File $filepath, "w" or die "Cannot create $filepath: $!";
+            print $fileh $tab2mage_err;
+            close $fileh or die "Error writing to $filepath: $!"; #may be disk full
+            push @files_to_zip_ascii, $filename;
+        }
+
+
+        warn "\tCreating new ZIP compressed archive\n";
+        my ($ZIPFH, $zip_filespec) = &tempfile($tempfile_template, DIR => MIMAS_DOWNLOAD_DIR, SUFFIX => '.zip', OPEN => 0) or die "Could not create ZIP compressed archive: $!";
+
+        #Convert text files from UNIX to DOS format, so that windows users can easily
+        #double-click to open them in Notepad.
+        for my $file (@files_to_zip_ascii) {
+            my $filepath = "$checkDir/$file";
+            my $filepath2 = "$checkDir/$file.new";
+            my $in = new IO::File $filepath or die "Cannot open $filepath: $!";
+            my $out = new IO::File $filepath2, "w" or die "Cannot create $filepath2: $!";
+            while (<$in>) {
+                s/\r?\n/\015\012/g;
+                print $out $_;
+            }
+            close $out;
+            close $in;
+            unlink $filepath or die "Cannot unlink $filepath: $!";
+            rename $filepath2, $filepath or die "Cannot rename $filepath2 to $filepath: $!";
+        }
+
+        if (MIMAS_PATH_ZIP) {
+            chdir $checkDir or die "Cannot chdir $checkDir: $!";
+            my @cmd = (MIMAS_PATH_ZIP, "-1", $zip_filespec,  @files_to_zip_ascii, @files_to_zip_binary);
+            system @cmd and die "Error $? with @cmd";
+        }
+        else {
+            my $zip = Archive::Zip->new();
+            binmode $ZIPFH;
+            warn "\tWriting ZIP object to archive \"$zip_filespec\"\n";
+            $zip->writeToFileHandle($ZIPFH) and die "Could not write to ZIP compressed archive!";
+            close($ZIPFH);
+        }
+        $dest_filespec = $zip_filespec;
+    }
+
+    my $filename = &fileparse($dest_filespec);
+
+    # Set permissions and ownership
+    warn "\tSetting sample download file permissions\n";
+    chmod 0444, $dest_filespec or die "Could not adjust permissions of $dest_filespec: $!";
+    # chown(-1, scalar(getgrnam('apache')), $dest_filespec) == 1 or die "Could not set sample download file ownership group: $!";
+
+    warn "\tGenerating web alert entry for sample download\n";
+    my $data = {
+        message  => "Download Request Job is complete!",
+        filename => $filename
+    };
+
+    $mimas_db->Web->AlertAdaptor->store(-type    => 'SAMPLE DOWNLOAD',
+        -data    => $data,
+        -user_id => $user->dbID);
+}
+
+sub sort_sample ($$) {
+    my ($a, $b) = @_;
+    return $a->experiment->dbID <=> $b->experiment->dbID
+    || $a->condition->display_order <=> $b->condition->display_order
+    || lc ($a->name) cmp lc($b->name)
+    || $a->name cmp $b->name
+    || $a->dbID <=> $b->dbID
+    ;
+}
+
+
+sub generation_summary_file {
+    my ($samples, $fileh) = @_;
+
+
+    my %all_exp_factors;
+
+    my %experiments;
+    for my $sample (values %$samples) {
+        my $experiment = $sample->experiment;
+        $experiments{$experiment->dbID} = $experiment;
+    }
+    my (@experiments) = map {$experiments{$_}} sort {$a cmp $b} keys %experiments;
+
+    for my $experiment (@experiments) {
+        for my $factor (values %{$experiment->factors}) {
+            $all_exp_factors{$factor->dbID} = $factor;
+        }
+    }
+
+    my @all_files;
+    my %all_factor_values;
+    for my $sample (sort sort_sample values %{$samples}) {
+        my $id = $sample->dbID;
+
+        my $name = $sample->name;
+        my $sample_attr_by_name = get_attr_by_name($samples, $sample, 1);
+
+        for my $att_name (sort keys %$sample_attr_by_name) {
+            my $v = $sample_attr_by_name->{$att_name};
+            my $attribute = $v->{attribute};
+            next unless exists $all_exp_factors{$attribute->dbID};
+            $all_factor_values{$sample->dbID}{$attribute->dbID} = $v; }
+            for my $sample_to_file (sort {
+                    ($format_order{$a->format} || -1) cmp ($format_order{$b->format} || -1)
+                    || $a->format cmp $a->format
+                    } values %{$sample->sample_to_files}) {
+                my $sample_file = $sample_to_file->sample_file;
+                push @all_files, $sample_to_file;
+            }
+    }
+
+    #create header
+    my @header_line = (
+            "probeset",
+            "signal",
+            "replicate",
+            );
+    for my $attid (sort keys %all_exp_factors) {
+        my $factor = $all_exp_factors{$attid};
+        push @header_line, $factor->name;
+    }
+    print $fileh join ("\t", map {clean_csv($_) || '""'} @header_line) . "\n";
+
+    #parse files
+    for my $sample_to_file(@all_files) {
+        my $sample_file = $sample_to_file->sample_file;
+        my $sample = $sample_to_file->sample;
+        my $format = $sample_file->format;
+        my $parser = new MIMAS::SampleFileParser(-format => $sample_file->format);
+        next unless $parser->is_normalized();
+
+        my $contents_ptr = $sample_file->contents_ptr;
+        use Symbol;
+        my $content_fh = gensym;
+        #this requires perl 5.8
+        open $content_fh, '<', $contents_ptr or die "Cannot open in-memory handle: $!";
+
+        my $replicate_number=0;
+        for my $sample0 (sort sort_sample values %{$sample->condition->samples})
+        {
+            $replicate_number++;
+            last if $sample0->dbID eq $sample->dbID;
+        }
+
+        my $cursor = $parser->parse($content_fh, $sample_file->file_name, $sample_to_file->hybridization_name);
+
+        while (my @stack = $cursor->getline) {
+            for my $stackel (@stack) {
+                my ($probeset, $signal) = @$stackel;
+                if (!defined $signal) {
+                    $signal = 'NA';
+                }
+                my @tab_line = (
+                        $probeset,
+                        $signal,
+                        $replicate_number,
+                        );
+                for my $attid (sort keys %all_exp_factors) {
+                    my $factor_value = $all_factor_values{$sample->dbID}{$attid};
+                    if (defined $factor_value) {
+                        push @tab_line, $factor_value->{value};
+                    }
+                    else {
+                        push @tab_line, "";
+                    }
+                }
+
+                print $fileh join ("\t", map {defined $_ && $_ ne "" ? clean_csv($_) : 'none'} @tab_line) . "\n";
+
+            }
+        }
+        close $content_fh;
+    }
+}

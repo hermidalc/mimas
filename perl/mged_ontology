@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+
+# get_download
+# MIMAS Website Retrieve Download File from Download Area Script
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+
+my $mged_term_all = $mimas_db->Library->MgedTermAdaptor->select_all();
+my $mged_desc;
+for my $mged_term (values %$mged_term_all) {
+    my $desc = $mged_term->description;
+    $desc =~ s/\s+/ /g if defined $desc;
+    my $deprecated = $mged_term->deprecated;
+    $desc = "[OBSOLETE $deprecated] $desc" if $deprecated;
+    $mged_desc->{$mged_term->mage_name} = $desc;
+}
+my $mged_desc_obj = toJSON ($mged_desc);
+
+my $cache_control = '';
+print $mimas_web->cgi->header(-type          => 'text/javascript',
+                              -charset       => 'utf-8',
+			      -encoding      => 'utf-8',
+			      -cache_control => $cache_control);
+
+print qq(
+    var mged_desc    = $mged_desc_obj;
+);
+exit;
+

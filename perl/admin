@@ -1,0 +1,766 @@
+#!/usr/bin/perl
+
+# admin
+# MIMAS Admin Pages and Processing
+#
+#######################################################
+# Copyright 2006 Leandro C. Hermida, Alexandre Gattiker
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+use MIMAS::ArrayDescriptionParser;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+my $base      = MIMAS_SCRIPT_BASE;
+
+## for testing
+# print STDERR map("$_ ---> $params->{$_}\n", sort keys %{$params}), "\n";
+##
+
+my $admin_web_pages = {
+                       home     => 1,
+                       users    => 1,
+                       arrays   => 1,
+                       curation => 1,
+                     };
+
+#
+## Authentication
+#
+unless (defined $params->{session_id}                                                             and 
+        defined $mimas_web->session($mimas_db->Web->SessionAdaptor->fetch($params->{session_id})) and 
+	defined $mimas_web->session->{login}) {
+    print $mimas_web->cgi->redirect("$base/main?page=login&expired=1");
+    exit;
+}
+
+#
+## Web Page Check
+#
+unless (defined $params->{page} and defined $admin_web_pages->{$params->{page}}) {
+    print $mimas_web->cgi->redirect("$base/admin?page=home&session_id=$params->{session_id}");
+    exit;
+}
+
+my $web_page   = $params->{page};
+my $session_id = $mimas_web->session->{_session_id};
+
+my $auth_user  = $mimas_db->User->UserAdaptor->select_by_dbID($mimas_web->session->{user_id});
+
+my %auth = (
+      'home'     => $auth_user->is_admin || $auth_user->is_curator,
+      'users'    => $auth_user->is_admin,
+      'arrays'   => $auth_user->is_admin || $auth_user->is_curator,
+      'curation' => $auth_user->is_curator,
+  );
+unless ($auth{$web_page}) {
+    print $mimas_web->cgi->redirect("$base/user?page=home&session_id=$params->{session_id}");
+    exit;
+}
+
+#allow upload of CDF files
+if ($web_page eq 'arrays') {
+    $CGI::DISABLE_UPLOADS = 0;
+    $CGI::POST_MAX        = MIMAS_UPLOAD_POST_MAX;
+}
+
+
+my $technology_id   = $params->{selected_technology};
+my $array_id   = $params->{selected_array};
+
+
+
+
+#
+## POST processing & error checking (mirrors JavaScript error checking in case of JavaScript failure)
+#
+my @errors;
+if ($mimas_web->cgi->request_method eq 'POST' and $mimas_web->http_referer =~ /^$base/) {
+    #
+    ## ARRAY COLLECTION
+    #
+    if ($web_page eq 'arrays') {
+		eval {
+		if ($array_id) {
+
+			my $old = $mimas_db->Library->ArrayAdaptor->select_by_dbID($array_id) || undef;
+
+			if ($params->{query_selected_array} eq $array_id and $params->{selected_technology2}) {
+				$mimas_db->Library->ArrayAdaptor->update(
+						-set        => [
+						display_name =>          $params->{display_name},
+						technology_id =>          $params->{selected_technology2},
+						arrayexpress_accession =>          $params->{arrayexpress_accession},
+						manufacturer =>          $params->{manufacturer},
+						],
+						-qualifiers => [
+						-array_id => $array_id,
+						]
+						);
+
+			}
+
+			if ($params->{query_selected_array} eq $array_id and $params->{delete_array}) {
+				$mimas_db->Library->ArrayAdaptor->remove_by_dbID($array_id);
+			}
+		}
+		if ($technology_id) {
+
+			my $old = $mimas_db->Library->TechnologyAdaptor->select_by_dbID($technology_id) || undef;
+			
+			if ($params->{query_selected_technology} eq $technology_id) {
+				if ($params->{technology_name}) {
+					$mimas_db->Library->TechnologyAdaptor->update(
+							-set        => [
+							name         =>          $params->{technology_name},
+							display_name =>          $params->{technology_display_name},
+							default_manufacturer =>          $params->{technology_manufacturer},
+							],
+							-qualifiers => [
+							-technology_id => $technology_id,
+							]
+							);
+
+ }
+			}
+
+			my $technology = $mimas_db->Library->TechnologyAdaptor->select_by_dbID($technology_id) || undef;
+
+			if (my @filehandles = $mimas_web->cgi->upload('upload_array_file')) {
+				for my $fh (@filehandles) {
+					my $filename = $fh;
+					my ($file_basename, $ext, @parse_errors) = parse_file_components($mimas_web, $filename);
+					push @errors, @parse_errors;
+
+					my $parser = new MIMAS::ArrayDescriptionParser();
+					my @parse_errors = $parser->parse($fh, $file_basename, $ext);
+					push @errors, @parse_errors;
+                    if (!@errors) {
+                        my $array = $mimas_db->Library->ArrayAdaptor->select_by_design_name($parser->array_name) || undef;
+                            $array_id = $mimas_db->Library->ArrayAdaptor->store(
+                                    -DESIGN_NAME => $parser->array_name,
+                                    -DISPLAY_NAME => $file_basename,
+                                    -NUM_PROBESETS => $parser->num_probesets,
+                                    -NUM_CEL_FEATURES => $parser->num_cel_features,
+                                    -TECHNOLOGY_ID => $technology_id,
+                                    -ARRAYEXPRESS_ACCESSION => undef,
+                                    -MANUFACTURER => $technology->default_manufacturer,
+                                    );
+
+					}
+				}
+			}
+
+			if (my $array_name = $params->{create_array_name}) {
+						$array_id = $mimas_db->Library->ArrayAdaptor->store(
+								-DESIGN_NAME => $array_name,
+								-DISPLAY_NAME => $array_name,
+								-NUM_PROBESETS => undef,
+								-NUM_CEL_FEATURES => undef,
+								-TECHNOLOGY_ID => $technology_id,
+								-ARRAYEXPRESS_ACCESSION => undef,
+								-MANUFACTURER => $technology->default_manufacturer,
+								);
+			}
+		}
+                    # commit to DB
+                    $mimas_db->commit();
+
+		}; #eval
+		if ($@) {
+			#It should be ok to display directly database errors to administrators
+			push @errors, $@;
+		}
+    }
+    #
+    ## bad POST action
+    #
+    else {
+        push @errors, 'Invalid action!';
+    }
+
+    # after processing POST without additional errors refresh page to
+    unless (@errors) {
+	    print $mimas_web->cgi->redirect("$base/admin?page=$web_page&session_id=$params->{session_id}&selected_technology=$technology_id&selected_array=$array_id");
+	    exit;
+    }
+}
+#
+## bad page request
+#
+elsif ($mimas_web->cgi->request_method ne 'GET') {
+    push @errors, 'Invalid page request!';
+}
+
+
+if (@errors) {
+    eval { $mimas_db->rollback() };
+    $mimas_web->error(@errors);
+}
+
+
+#
+## HTML GENERATION: do the page specific data object preparation, processing, and HTML page setup
+#
+my ($body, $jscript, $title, $onunload);
+
+my $selected_technology = $technology_id ? $mimas_db->Library->TechnologyAdaptor->select_by_dbID($technology_id) : undef;
+my $selected_array = $array_id ? $mimas_db->Library->ArrayAdaptor->select_by_dbID($array_id) : undef;
+
+if ($web_page eq 'home') {
+    # prepare HTML
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="page" value="$web_page">
+    HTML
+    
+    my $message_html;
+        $message_html = <<"        HTML";
+        <tr>
+          <td>
+           With great power comes great responsibility. Changes made in this area will immediately affect
+           all users.
+          </td>
+        </tr>
+        <tr><td><img width="1" height="450" alt="" src="/images/spacer.gif"></td></tr>
+        HTML
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">Administrator area</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    $message_html
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title    = "@{[$auth_user->first_name]} @{[$auth_user->last_name]} Home";
+    $onunload = '';
+}
+elsif ($web_page eq 'users') {
+	my $disabled_users   = $mimas_db->User->UserAdaptor->select_all_disabled();
+	my $enabled_users    = $mimas_db->User->UserAdaptor->select_all_enabled();
+
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="page" value="info">
+    <input type="hidden" name="session_id" value="$session_id">
+    HTML
+    
+    my $disabled_users_html = "";
+    for my $user1 (sort { lc($a->username) cmp lc($b->username) } values %{$disabled_users}) {
+        my $html = $mimas_web->cgi->escapeHTML($user1->username . " (" . $user1->first_name . " " . $user1->last_name . ")");
+        $disabled_users_html  .= "<option value='@{[$user1->dbID]}'>$html</option>";
+    }
+
+    my $enabled_users_html = "";
+    my $admin_users_html = "";
+    my $curator_users_html = "";
+    my $facility_users_html = "";
+    my %facility2user;
+    for my $user1 (sort { lc($a->username) cmp lc($b->username) } values %{$enabled_users}) {
+        my $groups = $user1->groups;
+        my $html = $mimas_web->cgi->escapeHTML($user1->username . " (" . $user1->first_name . " " . $user1->last_name . ")");
+        $enabled_users_html  .= "<option value='@{[$user1->dbID]}'>$html</option>";
+        $admin_users_html    .= "<option value='@{[$user1->dbID]}'>$html</option>" if $user1->is_admin;
+        $curator_users_html  .= "<option value='@{[$user1->dbID]}'>$html</option>" if $user1->is_curator;
+        if (grep {$_->name eq 'Facility editors'} values %$groups) {
+            my $ea = $user1->facilities;
+            for my $fa (values %$ea) {
+                my $facility = $mimas_web->cgi->escapeHTML($fa->name);
+                $facility2user{$facility} .= "<option value='@{[$user1->dbID]}'>$html</option>";
+            }
+        }
+    }
+    for my $facility (sort keys %facility2user) {
+        $facility_users_html .= "<optgroup label='$facility'>$facility2user{$facility}</optgroup>";
+    }
+
+	if ($disabled_users_html) {
+		$disabled_users_html = qq{The following users are waiting for approval:
+			<select name='edited_user'>$disabled_users_html</select>
+	    <input class="submitw115" type="submit" value="REVIEW">
+		};
+	}
+	else {
+		$disabled_users_html = qq{No users currently waiting for approval.};
+	}
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">Manage Users</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">User Approval</td></tr>
+	    <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr>
+	      <td class="cell01">
+        <form name="arrays" method="GET" action="user">
+				$disabled_users_html
+          $hidden_html
+        </form>
+	      </td>
+	    </tr>
+          </table>
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">Users</td></tr>
+	    <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr>
+	      <td class="cell01">
+        <form name="arrays" method="GET" action="user">
+		  	The following users are currently registered in MIMAS:
+			<select name='edited_user'>$enabled_users_html</select>
+	    <input class="submitw115" type="submit" value="REVIEW">
+          $hidden_html
+        </form>
+	      </td>
+	    </tr>
+	    <tr>
+	      <td class="cell01">
+              <table>
+              <tr>
+              <td>
+		  	List of administrators:<br>
+			<select multiple size=10>$admin_users_html</select>
+	      </td>
+	      <td>
+		  	List of curators:<br>
+			<select multiple size=10>$curator_users_html</select>
+	      </td>
+          </tr>
+          <tr>
+	      <td colspan=2>
+		  	List of facility editors:<br>
+			<select multiple size=10>$facility_users_html</select>
+	      </td>
+              </tr>
+              </table>
+	      </td>
+	    </tr>
+          </table>
+      </td>
+    </tr>
+    HTML
+    
+    $title    = 'Manage Users';
+    $onunload = '';
+}
+elsif ($web_page eq 'arrays') {
+    my $all_arrays = $mimas_db->Library->ArrayAdaptor->select_all();
+    my $all_technologies = $mimas_db->Library->TechnologyAdaptor->select_all();
+
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="page" value="$web_page">
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="query_selected_technology" value="@{[$selected_technology ? $selected_technology->dbID : ""]}">
+    <input type="hidden" name="query_selected_array" value="@{[$selected_array ? $selected_array->dbID : ""]}">
+    HTML
+
+    my $selected;
+    $selected = defined $selected_technology ? "" : "selected=\"selected\"";
+    my $technology_html = "<option $selected></option>";
+    for my $technology (sort { lc($a->name) cmp lc($b->name) } values %{$all_technologies}) {
+        my $html = $mimas_web->cgi->escapeHTML($technology->name);
+        $selected = (defined($selected_technology) and $technology->dbID eq $selected_technology->dbID) ? "selected=\"selected\"" : "";
+        $technology_html  .= "<option value='@{[$technology->dbID]}' $selected>$html</option>";
+    }
+    my $technology_name = $selected_technology ? $selected_technology->name : "";
+    my $technology_display_name = $selected_technology ? $selected_technology->display_name : "";
+    my $technology_manufacturer = $selected_technology ? $selected_technology->default_manufacturer : "";
+
+    my $upload_disabled = $technology_name ? "" : "disabled=\"disabled\"";
+
+    $selected = defined $selected_array ? "" : "selected=\"selected\"";
+    my $array_html = "<option $selected></option>";
+    for my $tech (sort {$a->dbID <=> $b->dbID} values %$all_technologies) {
+        $array_html  .= "<optgroup label='@{[$tech->display_name]}'>";
+        my $all_arrays = $mimas_db->Library->ArrayAdaptor->select_all_by_technologyID($tech->dbID);
+        for my $array (sort { lc($a->design_name) cmp lc($b->design_name) } values %{$all_arrays}) {
+            my $html = $mimas_web->cgi->escapeHTML($array->display_name . " [" . $array->design_name . "]");
+            $selected = (defined($selected_array) and $array->dbID eq $selected_array->dbID) ? "selected=\"selected\"" : "";
+            $array_html  .= "<option value='@{[$array->dbID]}' $selected>$html</option>";
+        }
+        $array_html  .= "<optgroup>";
+    }
+
+    $selected = defined $selected_technology ? "" : "selected=\"selected\"";
+    my $technology_html2 = "<option $selected></option>";
+    for my $technology (sort { $a->dbID <=> $b->dbID } values %{$all_technologies}) {
+        my $html = $mimas_web->cgi->escapeHTML($technology->display_name);
+        $selected = (defined($selected_array) and $selected_array->technology->dbID eq $technology->dbID) ? "selected=\"selected\"" : "";
+        $technology_html2  .= "<option value='@{[$technology->dbID]}' $selected>$html</option>";
+    }
+
+    my $display_name = defined($selected_array) ? $selected_array->display_name : "";
+    my $arrayexpress_accession = defined($selected_array) ? $selected_array->arrayexpress_accession : "";
+    my $manufacturer = defined($selected_array) ? $selected_array->manufacturer : "";
+
+
+    $body = <<"    HTML";
+    <tr><td class="header01">Array Collection</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+      ArrayExpress links:
+      <a href="http://www.ebi.ac.uk/aerep/?" target="_blank">[Query form]</a>
+      <a href="http://www.ebi.ac.uk/~ele/tables/Commercial_academic.htm" target="_blank">[List of arrays #1]</a>
+      <a href="http://www.ebi.ac.uk/aerep/result?queryFor=PhysicalArrayDesign" target="_blank">[List of arrays #2]</a>
+      <a href="http://www.ebi.ac.uk/aerep/result?queryFor=PhysicalArrayDesign&aProvider=Affymetrix" target="_blank">[List of arrays #2 (Affymetrix only)]</a>
+      </td>
+    </tr>
+    <tr>
+      <td>
+      Illumina links:
+      <a href="http://www.switchtoi.com/annotationfiles.ilmn" target="_blank">Illumina BGX file download</a>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <form name="arrays" enctype="multipart/form-data" method="post" action="$base/admin">
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">Technology</td></tr>
+            <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+            <tr>
+              <td>
+                <table class="submain01" width="100%" cellpadding="0" cellspacing="0" border="0">
+                    <td class="cell01">Modify technology<br>
+                        <select name="selected_technology" onChange='this.form.submit()'>$technology_html</select>
+                                </td>
+                    <td class="cell02">
+                        <table class="submain01" width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr><td class="cell01"> name </td><td class="cell01"><input type='text' name='technology_name' value='$technology_name' $upload_disabled></input></td> </tr>
+                            <tr><td class="cell01"> display name </td><td class="cell01"><input type='text' name='technology_display_name' value='$technology_display_name' $upload_disabled></input></td> </tr>
+                            <tr><td class="cell01"> default manufacturer </td><td class="cell01"><input type='text' name='technology_manufacturer' value='$technology_manufacturer' $upload_disabled></input></td> </tr>
+                            <tr>
+                              <td class="cell03">Add array</td>
+                              <td class="cell03">
+                                  <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                                  <tr>
+                                         <td colspan=2>Upload array definition file in CDF (Affymetrix) or BGX (Illumina) format:</td>
+                                  </tr>
+                                  <tr>
+                                         <td colspan=2><input type="file" name="upload_array_file" $upload_disabled></input></td>
+                                  </tr>
+                                  <tr>
+                                         <td>or enter (exact!!) array technical name (as referenced in CEL/Illumina files)</td>
+                                  </tr>
+                                  <tr>
+                                         <td><input type="text" name="create_array_name" $upload_disabled></input></td>
+                                  </tr>
+                                  </table>
+                              </td>
+                            </tr>
+                        </table>
+                        <input class="submitw115" type="submit" value="MODIFY">
+                        </td>
+                  </tr>
+                          </table>
+                        </td>
+                  </tr>
+
+
+            <tr><td class="tableheader01">Arrays</td></tr>
+            <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+                  <tr>
+                          <td>
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td class="cell01">Modify array<br>
+                        <select name="selected_array" onChange='this.form.submit()'>$array_html</select>
+                                </td>
+                    <td class="cell02">
+                        <table>
+                        <tr><td> <input class="submitw115" type="submit" name="delete_array" value="DELETE"></td><td>Don't worry, this won't work if any samples reference this array.</td> </tr>
+                        <tr><td> technology </td><td>
+                        <select name="selected_technology2">
+                        $technology_html2
+                        </select>
+                        </td> </tr>
+                        <tr><td> display name </td><td>
+                        <input type="text" name="display_name" size="30" value="$display_name">
+                        </td> </tr>
+                        <tr><td> ArrayExpress accession </td><td>
+                        <input type="text" name="arrayexpress_accession" size="30" value="$arrayexpress_accession">
+                        </td> </tr>
+                        <tr><td> manufacturer </td><td>
+                        <input type="text" name="manufacturer" size="30" value="$manufacturer">
+                        </td> </tr>
+                        </table>
+            <input class="submitw115" type="submit" value="MODIFY">
+                        </td> </tr>
+                        </table>
+                        </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+          </table>
+          $hidden_html
+        </form>
+      </td>
+    </tr>
+    HTML
+
+    $title    = 'Array Collection';
+    $onunload = '';
+}
+elsif ($web_page eq 'curation') {
+    my $experiments   = $mimas_db->Upload->ExperimentAdaptor->select_all();
+    my %users;
+    for my $experiment (values %$experiments) {
+        next if $users{$experiment->owner->dbID};
+        $users{$experiment->owner->dbID} = $experiment->owner;
+    }
+    my $curate_experiments = $mimas_db->Upload->ExperimentAdaptor->select_all_by_state(MIMAS_UPLOAD_IN_CURATION);
+
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="page" value="manage_uploads">
+    <input type="hidden" name="session_id" value="$session_id">
+    HTML
+    
+    my $submit_users_html = "";
+    for my $user1 (sort { lc($a->username) cmp lc($b->username) } values %users) {
+        my $html = $mimas_web->cgi->escapeHTML($user1->username . " (" . $user1->first_name . " " . $user1->last_name . ")");
+        $submit_users_html  .= "<option value='@{[$user1->dbID]}'>$html</option>";
+    }
+
+    my $curate_experiments_html = "";
+    my $curate_experiments_n = scalar values %{$curate_experiments};
+    my %quintessence_jscript;
+    for my $experiment (sort { $a->dbID <=> $b->dbID } values %{$curate_experiments}) {
+        my $html = $experiment->name;
+        $curate_experiments_html .= "<option value='@{[$experiment->dbID]}'>" . $mimas_web->cgi->escapeHTML($html) . "</option>";
+        $quintessence_jscript{$experiment->dbID} = get_experiment_quintessence($mimas_db, $experiment);
+    }
+    $jscript .= "var quintessence = " . toJSON(\%quintessence_jscript);
+
+    my $await_curation_html = $curate_experiments_n == 0 ? "No experiments awaiting curation" : <<"    HTML";
+        <form name="arrays" method="GET" action="upload">
+		  	The following $curate_experiments_n experiment(s) are awaiting curation:
+			<select id='quintessence_select' name='experiment_id' onchange='getQuintessence(this)'>$curate_experiments_html</select>
+	    <input class="submitw115" type="submit" value="REVIEW">
+          $hidden_html
+        </form>
+                <textarea id='quintessence' cols=80 rows=20></textarea>
+			<script type='text/javascript'>getQuintessence(document.getElementById('quintessence_select'))</script>
+    HTML
+
+    $body = <<"    HTML";
+    <tr><td class="header01">Curate experiments</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">Experiments by user</td></tr>
+	    <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr>
+	      <td class="cell01">
+        <form name="arrays" method="GET" action="upload">
+		  	The following users have submitted experiments in MIMAS:
+			<select name='edited_user'>$submit_users_html</select>
+	    <input class="submitw115" type="submit" value="REVIEW">
+          $hidden_html
+        </form>
+	      </td>
+	    </tr>
+          </table>
+      </td>
+    </tr>
+    <tr>
+      <td>
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">Experiments by status</td></tr>
+	    <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr>
+	      <td class="cell01">
+              $await_curation_html
+	      </td>
+	    </tr>
+	    <tr>
+	      <td class="cell01">
+              When curating an experiment be extremely careful with the following points:
+              <ul>
+              <li>Check user-defined controlled vocabulary terms carefully, by checking the following points
+                  and seeing how they relate to the already defined vocabulary for a given field.
+                  <ul>
+                      <li>Spelling (use the most standard spelling, e.g. 'cryptorchidism' rather than 'cryptorchism'; use greek letters when appropriate)</li>
+                      <li>Casing (most terms should be lowercase, e.g. 'kidney' rather than 'Kidney')</li>
+                      <li>Relevance (sometimes an already existing term can encompass what the user wanted to add, e.g. Sample Material Type 'fresh sample' can be any kind of sample)</li>
+                      <li>Consistency with the MGED Ontology, when appropriate</li>
+                      <li>For Strain names, use the nomenclature in the Swiss-Prot strain list (available in the <a href="http://www.ebi.ac.uk/newt/">NEWT taxonomy browser</a> or as a big <a href="ftp://ftp.expasy.org/databases/uniprot/current_release/knowledgebase/complete/docs/strains.txt">text file</a>)</li>
+                  </ul>
+              </li>
+              <li>
+              User-defined terms, once curated, will be visible to all users, which is why they should be checked carefully.
+              </li>
+              </ul>
+
+              <p>
+              How to type Unicode characters in Microsoft Windows (e.g. <a href="http://www.fileformat.info/info/unicode/char/03b1/index.htm">the greek letter alpha</a>)
+              
+
+	      </td>
+	    </tr>
+          </table>
+      </td>
+    </tr>
+    HTML
+    
+    $title    = 'Experiment Curation';
+    $onunload = '';
+}
+
+
+#
+## session processing
+#
+$mimas_web->session->{timestamp} = time;
+
+
+#
+## display HTML
+#
+print $mimas_web->cgi->header(-type          => 'text/html',
+	                      -charset       => 'utf-8',
+			      -encoding      => 'utf-8'), # -cache_control => 'no-store'),
+      
+      $mimas_web->cgi->start_html(-title     => "MIMAS -- $title",
+                                  -encoding  => 'utf-8',
+                                  -style     => {-src => "/styles/mimas_01.css?session_id=$session_id"},
+		                  -script    => [ {-src => "/js/mimas.js?session_id=$session_id"}, {-code => $jscript} ],
+				  -onUnload  => $onunload),
+      
+      $mimas_web->html->web_page(-template    => 'TEMPLATE_01',
+                                 -main_menu   => 'DEFAULT',
+		                 -detail_menu => 'ADMIN',
+		                 -navbar      => 'LOGOUT',
+		                 -body        => $body,
+						 -user        => $auth_user,
+						 ),
+      
+      $mimas_web->cgi->end_html;
+
+
+#
+## store session
+#
+$mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+
+exit;
+
+
+
+sub get_experiment_quintessence {
+    my ($mimas_db, $experiment) = @_;
+    my $text = "";
+    my $working_data    = $experiment->owner->working_data;
+    my $owner_full_name = $experiment->owner->full_name_reversed;
+
+    my $attributes       = $mimas_db->Library->AttributeAdaptor->select_all();
+	
+    my %arrays = map {$_->array->dbID, $_->array} map {values %$_} $experiment->samples;
+    my $array_names = join ", ", map {$_->display_name} values %arrays;
+    
+    $text .= join "", "\n\n[EXPERIMENT]\n\n",
+          "          ID: ", $experiment->dbID,               "\n",
+	  "        Name: ", $experiment->name,               "\n",
+	  "       Owner: ", $owner_full_name,                "\n",
+	  "    Username: ", $experiment->owner->username,    "\n",
+	  "       Email: ", $experiment->owner->email,       "\n",
+	  "      Arrays: ", $array_names,                    "\n",
+	  " Num Hybrids: ", $experiment->num_hybrids,        "\n";
+    
+
+    if ($experiment->owner->dbID eq $auth_user->dbID) {
+        $text .= "\nYou cannot curate this experiment because it was submitted by yourself.\n";
+    }
+
+    if (defined $working_data           and
+        defined $working_data->{upload} and
+	defined $working_data->{upload}->{$experiment->dbID}) {
+        # User-defined Experimental Factors and Factor Details
+	if (defined $working_data->{upload}->{$experiment->dbID}->{factors}) {
+	    $text .= "\n[User-defined Factors]\n";
+	    for my $factor (sort { lc($a->{name}) cmp lc($b->{name}) } values %{$working_data->{upload}->{$experiment->dbID}->{factors}}) {
+	        next unless $factor->{selected};  # IMPORTANT!!
+		$text .= "\n   Name: $factor->{name}\n".
+		        "Numeric: ". ($factor->{is_numeric} ? 'YES' : 'NO'). "\n";
+                if (defined $factor->{values}) {
+		    $text .= " Values: ";
+		    my $spaces = '';
+		    for my $condition_id (keys %{$factor->{values}}) {
+		        my $value = $factor->{values}->{$condition_id};
+			my $unitstr = '';
+			if (defined $factor->{units}) {
+			    for my $unit (values %{$factor->{units}}) {
+			        if (defined $unit->{selected} and $unit->{selected}->{$condition_id}) {
+				    $unitstr = $unit->{name};
+				    last;
+				}
+			    }
+			}
+		        $text .= "$spaces$value $unitstr\n";
+			$spaces = ' ' x 9;
+		    }
+		}
+	    }
+	}
+	# User-defined Attribute Details
+	if (defined $working_data->{upload}->{$experiment->dbID}->{details}) {
+            $text .= "\n[User-defined Attribute Details]\n";
+	    for my $detail (sort { $a->{attribute_id} <=> $b->{attribute_id} } values %{$working_data->{upload}->{$experiment->dbID}->{details}}) {
+	        my $selected_exists;
+		if (defined $detail->{values}) {
+		    for my $value (values %{$detail->{values}}) {
+		        if ($value->{selected}) { $selected_exists++; last }
+		    }
+		}
+		if (defined $detail->{units}) {
+		    for my $unit (values %{$detail->{units}}) {
+		        if ($unit->{selected}) { $selected_exists++; last }
+		    }
+		}
+		
+		if ($selected_exists) {
+		    $text .= "\nAttribute: " . $attributes->{$detail->{attribute_id}}->name . "\n";
+		    if (defined $detail->{values}) {
+		        $text .= "   Values: ";
+		        my $spaces = '';
+		        for my $value (sort { lc($a->{name}) cmp lc($b->{name}) } values %{$detail->{values}}) {
+		            next unless $value->{selected};  # IMPORTANT!!
+			    $text .= "$spaces$value->{name}\n";
+			    $spaces = ' ' x 11;
+		        }
+		    }
+		    if (defined $detail->{units}) {
+		        $text .= "    Units:\n";
+		        my $spaces = '';
+		        for my $unit (sort { lc($a->{name}) cmp lc($b->{name}) } values %{$detail->{units}}) {
+		            next unless $unit->{selected};  # IMPORTANT!!
+			    $text .= "$spaces$unit->{name}\n";
+			    $spaces = ' ' x 11;
+		        }
+		    }
+		}
+	    }
+        }
+    } else {
+        $text .= "\nNo user-defined data for this experiment.\n";
+    }
+    return $text;
+}
+
+

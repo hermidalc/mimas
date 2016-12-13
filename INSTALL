@@ -1,0 +1,75 @@
+Required Perl modules
+---------------------
+
+The following modules are a part of mod_perl:
+
+Apache
+Apache::Constants
+Apache::Registry
+
+The following modules must be installed separately:
+
+Compress::LZF
+Compress::Zlib
+IO::Zlib
+Archive::Tar
+Archive::Zip
+DBI
+DBD::Oracle
+HTML::Entities
+JSON
+MIME::Base64
+MIME::Lite
+Tie::Hash::Indexed
+XML::Parser
+Apache::DBI
+Apache::Session
+
+
+The MIMAS Export feature creates a spreadsheet in tab2mage format.
+Optionally, the Tab2MAGE program can be installed to parse this
+spreadsheet and report any errors (this is strongly recommended).
+The 'dot' utility from the GraphViz package may also optionally be
+installed for Tab2MAGE to create images illustrating relationships.
+
+The following packages are required by Tab2MAGE as described
+in its README file (DBI and DBD::mysql are said to be required
+therein, but that's not relevant for the usage made by MIMAS).
+
+- Bio::MAGE (a.k.a. Perl MAGEstk. Note that this module requires
+             XML::Xerces and the Xerces C++ library from Apache
+             to be installed.)
+- LWP::UserAgent
+- Digest::MD5
+- Tie::IxHash
+- List::MoreUtils
+- Text::CSV_XS
+- Readonly   (and preferably Readonly::XS, if available)
+- Config::YAML
+- Class::Std
+- Parse::RecDescent
+
+Installing the Xerces C++ library is quite a hassle. Here are typical
+steps for a Linux platform (for installing in /usr/local/mimas/xerces-c-2_7_0).
+
+wget http://www.apache.org/dist/xml/xerces-c/source/xerces-c-src_2_7_0.tar.gz
+tar zxf xerces-c-src_2_7_0.tar.gz
+cd xerces-c-src_2_7_0
+export XERCESCROOT=$PWD
+cd $XERCESCROOT/src/xercesc
+autoconf
+./runConfigure -plinux -cgcc -xg++ -minmem -nsocket -tnative -rpthread -P /usr/local/mimas/xerces-c-2_7_0
+gmake
+gmake install
+
+Then:
+export XERCESCROOT=/usr/local/mimas/xerces-c-2_7_0/
+...install XML::Xerces perl module...
+
+
+
+Configuration
+-------------
+cp libs/MIMAS/Consts/example.pm libs/MIMAS/Consts/MIMAS.pm
+
+Set settings for database access, and paths to directories and programs.

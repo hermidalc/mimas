@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+
+# get_download
+# MIMAS Website Retrieve Download File from Download Area Script
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+my $base      = MIMAS_SCRIPT_BASE;
+
+## for testing
+# print STDERR map("$_ ---> $params->{$_}\n", sort keys %{$params}), "\n";
+##
+
+#
+## Authentication
+#
+unless (defined $params->{session_id} and defined $mimas_web->session($mimas_db->Web->SessionAdaptor->fetch($params->{session_id})) and defined $mimas_web->session->{login}) {
+    print $mimas_web->cgi->redirect("$base/main?page=login&expired=1");
+    exit;
+}
+
+my $user_id = $mimas_web->session->{user_id};
+
+#
+## GET processing & error checking
+#
+my @errors;
+if ($mimas_web->cgi->request_method eq 'GET') {
+    if (!defined $params->{filename}) {
+        push @errors, "File name required to get download!";
+    } elsif ($params->{filename} !~ /^${user_id}_/) {
+        push @errors, "User not authorized to download this file!";
+    } elsif (!-e "@{[MIMAS_DOWNLOAD_DIR]}/$params->{filename}") {
+        push @errors, "File '$params->{filename}' does not exist!";
+    } elsif (!-f "@{[MIMAS_DOWNLOAD_DIR]}/$params->{filename}") {
+        push @errors, "File '$params->{filename}' is not an appropriate file!";
+    } elsif (!-r "@{[MIMAS_DOWNLOAD_DIR]}/$params->{filename}") {
+        push @errors, "File '$params->{filename}' is not readable!";
+    }
+}
+else {
+    push @errors, 'Invalid page request!';
+}
+
+$mimas_web->error(@errors) if @errors;
+
+
+# print $mimas_web->cgi->header(-type        => 'application/octet-stream',
+#                               -attachment  => $params->{filename});
+# 
+# open(ARCHIVE, "@{[MIMAS_DOWNLOAD_DIR]}/$params->{filename}");
+# binmode ARCHIVE;
+# while (read ARCHIVE, my $buffer, MIMAS_FILE_BUFFER_SIZE) { print $buffer }
+# close(ARCHIVE);
+
+# do this instead
+print $mimas_web->cgi->redirect("$base/downloads/$params->{filename}");
+
+exit;
+

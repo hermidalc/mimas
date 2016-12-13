@@ -1,0 +1,618 @@
+#!/usr/bin/perl
+
+# main
+# MIMAS Website Main External Pages and Processing
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+my $base      = MIMAS_SCRIPT_BASE;
+
+## for testing
+# print STDERR map("$_ ---> $params->{$_}\n", sort keys %{$params}), "\n";
+##
+
+my $main_web_pages = {
+                       about    => 1,
+                       home     => 1,
+                       login    => 1,
+                       register => 1
+                     };
+
+#
+## Web Page Check
+#
+unless (defined $params->{page} and defined $main_web_pages->{$params->{page}}) {
+    print $mimas_web->cgi->redirect("$base/main?page=home");
+    exit;
+}
+
+#
+## Session Loading (if session exists)
+#
+if (defined $params->{session_id} and !defined $mimas_web->session($mimas_db->Web->SessionAdaptor->fetch($params->{session_id}))) {
+    print $mimas_web->cgi->redirect("$base/main?page=home");
+    exit;
+}
+
+my $web_page   = $params->{page};
+my $session_id = $mimas_web->session->{_session_id} if defined $mimas_web->session;
+
+
+#
+## POST processing & error checking (mirrors JavaScript error checking in case of JavaScript failure)
+#
+my @errors;
+if ($mimas_web->cgi->request_method eq 'POST' and $mimas_web->http_referer =~ /^$base/) {
+    #
+    ## LOGIN: authenticate and process login
+    #
+    #Here we use 'username' instead of 'usernme' as the field name, so that Firefox's "Remember password" feature works
+    if ($web_page eq 'login' and defined $params->{username} and defined $params->{password}) {
+        if (my $user_id = $mimas_db->User->AuthAdaptor->auth_login(-username => $params->{username}, -password => $params->{password})) {
+            # create a login session
+            $mimas_web->session($mimas_db->Web->SessionAdaptor->create()) or $mimas_web->error(MIMAS_DB_ERROR_MSG);
+            
+            $mimas_web->session->{login}++;
+            $mimas_web->session->{user_id}   = $user_id;
+            $mimas_web->session->{timestamp} = time;
+            
+            # after processing login without errors set redirect to user home page
+            print $mimas_web->cgi->redirect("$base/user?page=home&session_id=@{[$mimas_web->session->{_session_id}]}");
+            
+            # store session
+            $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+        } else {
+            print $mimas_web->cgi->redirect("$base/main?page=${web_page}&failed=1");
+        }
+        
+        exit;
+    }
+    elsif ($web_page eq 'register') {
+        for my $name (keys %{$params}) {
+            $params->{$name} = $name eq 'address' ?   clean_freetext($params->{$name})
+                                                  : clean_whitespace($params->{$name});
+        }
+        
+        my $lab = $mimas_db->User->LabAdaptor->select_by_pi_email_ci($params->{pi_email});
+        
+        push @errors, 'Username greater than 15 characters! Please fix username.'                      if length $params->{usernme} > 15;
+        push @errors, 'Password must be greater than 5 characters!  Please fix password.'              if length $params->{password} < 6;
+        push @errors, 'Username contains invalid characters! Please fix username.'                     if $params->{usernme} =~ /\W/;
+        push @errors, 'Username must contain at least one alphabetic character! Please fix username.'  if $params->{usernme} !~ /[a-zA-Z]/;
+        push @errors, 'Password contains invalid characters! Please fix password.'                     if $params->{password} =~ /\s/;
+        push @errors, 'Password and confirmation do not match! Please fix password.'                   if $params->{password} ne $params->{confirm_pass};
+        push @errors, 'Username already exists in MIMAS!  Please select another username.'             if $mimas_db->User->UserAdaptor->select_by_username_ci($params->{usernme});
+        push @errors, 'Email address already exists in MIMAS!  Please contact MIMAS Administrator.'    if $mimas_db->User->UserAdaptor->select_by_email_ci($params->{email});
+        push @errors, 'Email address is not in a valid format. Please correct email address.'          if $params->{email}    !~ /^[a-zA-Z0-9_\-\.\+]+@[a-zA-Z0-9_\-\.\+]+$/;
+        push @errors, 'PI email address is not in a valid format. Please correct PI email address.'    if $params->{pi_email} !~ /^[a-zA-Z0-9_\-\.\+]+@[a-zA-Z0-9_\-\.\+]+$/;
+        push @errors, 'Laboratory name already exists in MIMAS! Please choose another name.'           if !defined $lab and $mimas_db->User->LabAdaptor->select_by_name_ci($params->{lab_name});
+        
+        unless (@errors) {
+            # add 'http://' to URLs if they exist and don't already have that
+            for ($params->{lab_url}, $params->{institute_url}) {
+                next if !defined or $_ eq '';
+                s/^\W+//;
+                s/^http:+\/+/http:\/\//i;
+                $_ = "http://$_" unless m/^http:\/\//i;
+            }
+            
+            # title ID correction
+            $params->{title_id} = undef unless $params->{title_id};
+            
+            if (defined $mimas_web->session) {
+                eval {
+                    my $lab_id;
+                    unless (defined $lab) {
+                        my $organization = $mimas_db->User->OrganizationAdaptor->select_by_name_ci($params->{institution});
+                        my $organization_id;
+                        unless (defined $organization) {
+                            $organization_id = $mimas_db->User->OrganizationAdaptor->store(-name       => $params->{institution},
+                                                                                           -url        => $params->{institute_url},
+                                                                                           -valid      => 0,                        # not valid until registration accepted
+                                                                                           -country_id => $params->{country_id});
+                        } else {
+                            $organization_id = $organization->dbID;
+                        }
+                        
+                        $lab_id = $mimas_db->User->LabAdaptor->store(-name            => $params->{lab_name},
+                                                                     -address         => $params->{address},
+                                                                     -postcode        => $params->{postcode},
+                                                                     -state           => $params->{state},
+                                                                     -city            => $params->{city},
+                                                                     -url             => $params->{lab_url},
+                                                                     -pi_name         => $params->{pi_name},
+                                                                     -pi_email        => $params->{pi_email},
+                                                                     -valid           => 0,                     # not valid until registration accepted
+                                                                     -organization_id => $organization_id);
+                    } else {
+                        $lab_id = $lab->dbID;
+                    }
+                    
+                    $mimas_db->User->UserAdaptor->store(-username    => $params->{usernme},
+                                                        -password    => $params->{password},
+                                                        -disabled    => 1,                       # disabled until registration accepted
+                                                        -first_name  => $params->{first_name},
+                                                        -middle_name => $params->{middle_name},
+                                                        -last_name   => $params->{last_name},
+                                                        -position    => $params->{position},
+                                                        -email       => $params->{email},
+                                                        -phone       => $params->{phone},
+                                                        -fax         => $params->{fax},
+                                                        -title_id    => $params->{title_id},
+                                                        -lab_id      => $lab_id);
+                    
+		
+                    # send e-mail to MIMAS admin
+                    send_email(
+                        'From'     => MIMAS_ADMIN_EMAIL_ADDRESS,
+                        'To'       => MIMAS_ADMIN_EMAIL_ADDRESS,
+                        'Subject'  => '[MIMAS] Registration request',
+                        'Data'     => "User '$params->{usernme}' has requested to register to MIMAS.\n\n"
+                        . "First name: $params->{first_name}\n"
+                        . "Last name: $params->{last_name}\n"
+                        . "E-mail: $params->{email}\n"
+                        . "Lab head: $params->{pi_name} <$params->{pi_email}>\n"
+                        ,
+                    ) or die "Could not send notification email: $!";
+
+                    # commit to DB
+                    $mimas_db->commit();
+                };
+                
+                unless ($@) {
+                    # delete session
+                    $mimas_db->Web->SessionAdaptor->delete($mimas_web->session) or $mimas_web->error(MIMAS_DB_ERROR_MSG);
+                    
+                    # after processing POST redirect to appropriate place
+                    print $mimas_web->cgi->redirect("$base/main?page=home");
+                    exit;
+                } else {
+                    push @errors, MIMAS_DB_ERROR_MSG;
+                    $mimas_db->warn("USER REGISTRATION transaction aborted:\n$@");
+                }
+            } else {
+                # create a registration session
+                $mimas_web->session($mimas_db->Web->SessionAdaptor->create()) or $mimas_web->error(MIMAS_DB_ERROR_MSG);
+                
+                $mimas_web->session->{register} = \%{$params};  # need to dereference then reference because $params is a CGI tied hash variable
+                $mimas_web->session->{timestamp} = time;
+                
+                print $mimas_web->cgi->redirect("$base/main?page=${web_page}&session_id=@{[$mimas_web->session->{_session_id}]}");
+                
+                # store session
+                $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+                
+                exit;
+            }
+        }
+    }
+    #
+    ## bad POST action
+    #
+    else {
+        push @errors, 'Invalid action!';
+    }
+}
+#
+## GET processing & error checking
+#
+elsif ($mimas_web->cgi->request_method eq 'GET') {
+    #
+    ## LOGIN: authenticate user for logout if we came from internal hyperlink
+    #
+    if (defined $params->{session_id} and defined $params->{logout}) {
+        # delete session
+        $mimas_db->Web->SessionAdaptor->delete($mimas_web->session) or $mimas_web->error(MIMAS_DB_ERROR_MSG);
+        
+        # after processing logout recall myself
+        print $mimas_web->cgi->redirect("$base/main?page=${web_page}");
+        exit;
+    }
+    #
+    ## USER REGISTRATION: clear registration and session
+    #
+    elsif (defined $params->{session_id} and defined $params->{clear_registration}) {
+        # delete session
+        $mimas_db->Web->SessionAdaptor->delete($mimas_web->session) or $mimas_web->error(MIMAS_DB_ERROR_MSG);
+        
+        # after processing logout recall myself
+        print $mimas_web->cgi->redirect("$base/main?page=${web_page}");
+        exit;
+    }
+}
+#
+## bad page request
+#
+else {
+    push @errors, 'Invalid page request!';
+}
+
+$mimas_web->error(@errors) if @errors;
+
+
+#
+## HTML GENERATION: do the page specific data object preparation, processing, and HTML page setup
+#
+my ($body, $jscript, $title, $onunload);
+
+my $hidden_html = <<HTML;
+<input type="hidden" name="page" value="$web_page">
+HTML
+
+if ($web_page eq 'home') {
+    my $welcome_html = $mimas_web->mimas_ssi("welcome.html");
+    my $news_html = $mimas_web->mimas_ssi("news.html");
+
+    $body = <<"    HTML";
+    <tr><td class="header01">Welcome to the Multiomics Information Management and Annotation System</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+      <div style='width: 100%; clear: both'>
+      <div style='float: left; width: 47%; margin: 0 1%;'>
+        $welcome_html
+      </div>
+      <div style='float: left; width: 43%; margin: 0 1% 0 5%;'>
+           <div id='news'>
+       <h1 class="headernews01">MIMAS news</h1>
+           <div id='newscontent'>
+           $news_html
+           </div>
+           </div>
+      </div>
+      </div>
+      </td>
+    </tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title   = 'Multiomics Information Management and Annotation System';
+}
+elsif ($web_page eq 'login') {
+    # prepare HTML
+    my $message_html = defined $params->{failed}  ? 'Login incorrect!! Please try again'                         :
+                       defined $params->{expired} ? 'Session has expired or failed to load. Please log in again' : 
+                                                    'Please enter your username and password';
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">MIMAS LOGIN</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+        <form name="mimas_login" method="post" action="$base/main" onSubmit="return checklogin(this)">
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">$message_html</td></tr>
+            <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+            <tr>
+              <td>
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td class="cell01rt">Username:</td>
+                    <td class="cell02"><input type="text" name="username" maxlength="15" size="20" tabindex="1"></td>
+                  </tr>
+                  <tr>
+                    <td class="cell03rt">Password:</td>
+                    <td class="cell04"><input type="password" name="password" size="20" tabindex="2"></td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr><td class="submit"><input class="submitw115" type="submit" value="LOGIN" tabindex="3"></td></tr>
+            <tr><td class="reset"><input class="resetw115" type="reset" value="Reset" tabindex="4"></td></tr>
+          </table>
+          $hidden_html
+        </form>
+      </td>
+    </tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title   = 'Login';
+}
+elsif ($web_page eq 'about') {
+    my $about_html = $mimas_web->mimas_ssi("about.html");
+
+    $body = <<"    HTML";
+    <tr><td class="header01">About the MIMAS Project</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+        $about_html
+      </td>
+    </tr>
+    <tr><td><img width="1" height="400" alt="" src="/images/spacer.gif"></td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title   = 'About the MIMAS Project';
+}
+elsif ($web_page eq 'register') {
+    my ($title_id, $country_id);
+    my ($username, $password, $first_name, $middle_name, $last_name,     $position, $phone,    $fax,  $email, $lab_name,
+        $pi_name,  $pi_email, $lab_url,    $institution, $institute_url, $address,  $postcode, $city, $state) = ('') x 19;
+    
+    my $hidden_html = "<input type='hidden' name='page' value='$web_page'>";
+    
+    my ($register_html, $submit_button, $onreset);
+    if (defined $mimas_web->session) {
+        my $session_id = $mimas_web->session->{_session_id};
+        
+        $username    = $mimas_web->session->{register}->{usernme};
+        $password    = $mimas_web->session->{register}->{password};
+        $title_id    = defined $mimas_web->session->{register}->{title_id}
+                         ? $mimas_web->session->{register}->{title_id}
+                         : undef;
+        $first_name  = $mimas_web->session->{register}->{first_name};
+        $middle_name = defined $mimas_web->session->{register}->{middle_name}
+                         ? $mimas_web->session->{register}->{middle_name}
+                         : '';
+        $last_name   = $mimas_web->session->{register}->{last_name};
+        $position    = $mimas_web->session->{register}->{position};
+        $phone       = $mimas_web->session->{register}->{phone};
+        $fax         = defined $mimas_web->session->{register}->{fax}
+                         ? $mimas_web->session->{register}->{fax}
+                         : '';
+        $email       = $mimas_web->session->{register}->{email};
+        $pi_email    = $mimas_web->session->{register}->{pi_email};
+
+        # Suggest PI name if registering user is PI
+        if ($email eq $pi_email and !$pi_name and $last_name) {
+            $pi_name = $first_name . " " . $last_name;
+        }
+
+        my ($readonly, $disabled) = ('') x 3;
+        if (my $lab = $mimas_db->User->LabAdaptor->select_by_pi_email_ci($pi_email)) {
+            $lab_name      = $lab->name;
+            $pi_name       = $lab->pi_name;
+            $pi_email      = $lab->pi_email;
+            $lab_url       = defined $lab->url ? $lab->url : '';
+            $institution   = $lab->organization->name;
+            $institute_url = defined $lab->organization->url ? $lab->organization->url : '';
+            $address       = $lab->address;
+            $postcode      = $lab->postcode;
+            $city          = $lab->city;
+            $state         = defined $lab->state ? $lab->state : '';
+            $country_id    = $lab->organization->country->dbID;
+            
+            $readonly      = 'readonly';
+            $disabled      = 'disabled';
+        }
+        
+        $submit_button = 'REGISTER';
+        $onreset       = "if (confirm('Reset entire page and start over?')) location.replace('@{[$mimas_web->cgi->url(-absolute => 1, -query => 1)]}&clear_registration=1'); else return false";
+        
+        $hidden_html  .= "<input type='hidden' name='session_id' value='$session_id'>";
+        
+        my $countries = $mimas_db->User->CountryAdaptor->select_all();
+        my $countries_html = "<option></option>";
+        for my $country (sort { lc($a->name) cmp lc($b->name) } values %{$countries}) {
+            my $selected     = (defined $country_id and $country_id == $country->dbID) ? 'selected' : '';
+            my $country_html = $mimas_web->cgi->escapeHTML($country->name);
+            $countries_html .= "<option value='@{[$country->dbID]}' $selected>$country_html</option>";
+        }
+        
+        $_ = $mimas_web->cgi->escapeHTML($_) for $username, $password,    $first_name,    $middle_name, $last_name,  $position,
+                                                 $phone,    $fax,         $email,         $lab_name,    $pi_name,    $pi_email,
+                                                 $lab_url,  $institution, $institute_url, $address,     $postcode,   $city,
+                                                 $state;
+        
+        $register_html = <<"        HTML";
+        <tr>
+          <td class="cell02" colspan="2"><img width="1" height="10" alt="" src="/images/spacer.gif"></td>
+        </tr>
+        <tr>
+          <td class="cell01">Laboratory/Group Name<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><input type="text" name="lab_name" class="$disabled" size="60" value="$lab_name" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">Principal Investigator<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><input type="text" name="pi_name" class="$disabled" size="40" value="$pi_name" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">Principal Investigator Email<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><input type="text" name="pi_email" class="disabled" size="40" value="$pi_email" readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">Lab URL</td>
+          <td class="cell02"><input type="text" name="lab_url" class="$disabled" size="60" value="$lab_url" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">Institution<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><input type="text" name="institution" class="$disabled" size="60" value="$institution" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">Institute URL</td>
+          <td class="cell02"><input type="text" name="institute_url" class="$disabled" size="60" value="$institute_url" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">Address<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><textarea rows="4" cols="60" name="address" wrap="off" class="$disabled" $readonly>$address</textarea></td>
+        </tr>
+        <tr>
+          <td class="cell01">Postal Code<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><input type="text" name="postcode" class="$disabled" size="20" value="$postcode" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">City<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell02"><input type="text" name="city" class="$disabled" size="30" value="$city" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell01">State/Canton/Province</td>
+          <td class="cell02"><input type="text" name="state" class="$disabled" size="30" value="$state" $readonly></td>
+        </tr>
+        <tr>
+          <td class="cell03">Country<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell04"><select name="country_id" class="$disabled" $disabled>$countries_html</select></td>
+        </tr>
+        HTML
+    } else {
+        $submit_button = 'SUBMIT & PROCEED';
+        $onreset       = "return confirm('Erase ALL data and start over?')";
+        
+        $register_html = <<"        HTML";
+        <tr>
+          <td class="cell03">Principal Investigator Email<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+          <td class="cell04"><input type="text" name="pi_email" size="40" value=""></td>
+        </tr>
+        HTML
+    }
+    
+    my $titles = $mimas_db->User->TitleAdaptor->select_all();
+    my $titles_html = "<option></option>";
+    for my $title (sort { lc($a->name) cmp lc($b->name) } values %{$titles}) {
+        my $selected   = (defined $title_id and $title_id == $title->dbID) ? 'selected' : '';
+        my $title_html = $mimas_web->cgi->escapeHTML($title->name);
+        $titles_html  .= "<option value='@{[$title->dbID]}' $selected>$title_html</option>";
+    }
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">User Registration</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+        <form name="user_registration" method="post" action="$base/main" onSubmit="return checkuserinfo(this)" onReset="$onreset">
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01"><img width="1" height="10" alt="" src="/images/spacer.gif"></td></tr>
+            <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+            <tr>
+              <td>
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td class="cell01">Login/Username<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02">
+                      <input type="text" name="usernme" maxlength="15" value="$username">
+                      <img width="5" height="1" alt="" src="/images/spacer.gif"><span class="itnote">(max. 15 characters)</span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Password<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02">
+                      <input type="password" name="password" value="$password">
+                      <img width="5" height="1" alt="" src="/images/spacer.gif"><span class="itnote">(min. 6 characters)</span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Confim Password<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02"><input type="password" name="confirm_pass" value="$password"></td>
+                  </tr>
+                  <tr>
+                    <td class="cell02" colspan="2"><img width="1" height="10" alt="" src="/images/spacer.gif"></td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Title</td>
+                    <td class="cell02"><select name="title_id">$titles_html</select></td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">First<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span>, Middle, Last Name<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02">
+                      <input type="text" name="first_name" value="$first_name">
+                      <img width="1" height="1" alt="" src="/images/spacer.gif">
+                      <input type="text" name="middle_name" size="15" value="$middle_name">
+                      <img width="1" height="1" alt="" src="/images/spacer.gif">
+                      <input type="text" name="last_name" value="$last_name">
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Position<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02"><input type="text" name="position" size="60" value="$position"></td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Phone Number<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02"><input type="text" name="phone" size="25" value="$phone"></td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Fax Number</td>
+                    <td class="cell02"><input type="text" name="fax" size="25" value="$fax"></td>
+                  </tr>
+                  <tr>
+                    <td class="cell01">Email Address<img width="3" height="1" alt="" src="/images/spacer.gif"><span class="asterisk">*</span></td>
+                    <td class="cell02"><input type="text" name="email" size="40" value="$email"></td>
+                  </tr>
+                  $register_html
+                </table>
+              </td>
+            </tr>
+            <tr><td class="submit"><input class="submitw115" type="submit" value="$submit_button"></td></tr>
+            <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+          </table>
+          $hidden_html
+        </form>
+      </td>
+    </tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title    = 'User Registration';
+    $onunload = '';
+}
+
+
+#
+## session processing if needed
+#
+$mimas_web->session->{timestamp} = time if defined $mimas_web->session;
+
+
+#
+## display HTML
+#
+my $unique_arg = $session_id ? "session_id=$session_id" : int rand(1e14);
+
+print $mimas_web->cgi->header(-type          => 'text/html',
+                              -charset       => 'utf-8',
+                              -encoding      => 'utf-8'),
+      
+
+      #Add a variable parameter to the mimas_01.css & mimas.js URLs to ensure it is not cached by the client
+      #between server updates
+      $mimas_web->cgi->start_html(-title     => "MIMAS -- $title",
+                                  -encoding  => 'utf-8',
+                                  -style     => {-src => "/styles/mimas_01.css?$unique_arg"},
+                                  -script    => [ {-src => "/js/mimas.js?$unique_arg"}, {-code => $jscript} ],
+                                  -onUnload  => $onunload),
+      
+      $mimas_web->html->web_page(-template    => 'TEMPLATE_01',
+                                 -main_menu   => 'EXTERNAL',
+                                 -detail_menu => 'NONE',
+                                 -navbar      => 'LOGIN',
+                                 -body        => $body,
+                                 -user        => undef,
+								 ),
+      
+      $mimas_web->cgi->end_html;
+
+
+#
+## store session if needed
+#
+$mimas_db->Web->SessionAdaptor->store($mimas_web->session) if defined $mimas_web->session;
+
+exit;
+

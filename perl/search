@@ -1,0 +1,1156 @@
+#!/usr/bin/perl
+
+# search
+# MIMAS Website Search Pages and Processing
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+use IO::File;
+use IO::Dir;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+my $base      = MIMAS_SCRIPT_BASE;
+
+
+## for testing
+# print STDERR map("$_ ---> $params->{$_}\n", sort keys %{$params}), "\n";
+##
+
+my $search_web_pages = {
+                         search_rep        => 1,
+                         search_results    => 1,
+                         view_sample       => 1,
+                         request_download  => 1
+                       };
+
+#
+## Authentication
+#
+unless (defined $params->{session_id}                                                             and 
+        defined $mimas_web->session($mimas_db->Web->SessionAdaptor->fetch($params->{session_id})) and 
+	defined $mimas_web->session->{login}) {
+    print $mimas_web->cgi->redirect("$base/main?page=login&expired=1");
+    exit;
+}
+
+#
+## Web Page Check
+#
+unless (defined $params->{page} and defined $search_web_pages->{$params->{page}}) {
+    print $mimas_web->cgi->redirect("$base/search?page=search_rep&session_id=$params->{session_id}");
+    exit;
+}
+
+my $web_page   = $params->{page};
+my $session_id = $mimas_web->session->{_session_id};
+
+my $user       = $mimas_db->User->UserAdaptor->select_by_dbID($mimas_web->session->{user_id});
+
+
+#
+## POST processing & error checking (mirrors JavaScript error checking in case of JavaScript failure)
+#
+my @errors;
+if ($mimas_web->cgi->request_method eq 'POST' and $mimas_web->http_referer =~ /^$base/ or defined($params->{download_sample_ids}) or defined ($params->{download_exp_ids})) {
+    #
+    ## SEARCH REPOSITORY: search criteria selection
+    #
+    if ($web_page eq 'search_rep' and defined $params->{selected_attr_ids}) {
+        my $attributes = $mimas_db->Library->AttributeAdaptor->select_all();
+	
+	my @selected_attr_ids = split /\0/, $params->{selected_attr_ids};
+        
+	for my $attr_id (@selected_attr_ids) {
+            push @errors, "Attribute ID: $attr_id does not exist in MIMAS!" unless defined $attributes->{$attr_id};
+        }
+	
+        # process criteria selection in session if no errors
+	unless (@errors) {
+	    $mimas_web->session->{search}->{selected_attr_ids} = \@selected_attr_ids;
+	    $mimas_web->session->{timestamp} = time;
+	    
+	    # after processing POST without errors recall page as GET
+	    print $mimas_web->cgi->redirect("$base/search?page=${web_page}&session_id=${session_id}");
+	    
+	    # store session
+	    $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+	    
+	    exit;
+	}
+    }
+    #
+    ## SEARCH REPOSITORY: detailed search setup and searching of repository
+    #
+    elsif ($web_page eq 'search_rep') {
+        my $attributes = $mimas_db->Library->AttributeAdaptor->select_all();
+	
+	my @selected_attr_ids = (defined $mimas_web->session->{search} and defined $mimas_web->session->{search}->{selected_attr_ids})   
+                                   ? @{$mimas_web->session->{search}->{selected_attr_ids}}
+			           : ();
+	
+	# error check & prepare attributes data
+	my $search_detail;
+	for my $attr_id (@selected_attr_ids) {
+	    my $attribute = $attributes->{$attr_id};
+	    if (defined $params->{"attr_values_@{[$attribute->dbID]}"}) {
+	        # clean up attribute values and units
+		if ($attribute->upload_form_type eq 'textarea') {
+                    $params->{"attr_values_@{[$attribute->dbID]}"} = clean_freetext($params->{"attr_values_@{[$attribute->dbID]}"});
+                } else {
+                    $params->{"attr_values_@{[$attribute->dbID]}"} = clean_whitespace($params->{"attr_values_@{[$attribute->dbID]}"});
+                }
+		if (defined $params->{"attr_units_@{[$attribute->dbID]}"}) {
+		    $params->{"attr_units_@{[$attribute->dbID]}"} = clean_whitespace($params->{"attr_units_@{[$attribute->dbID]}"});
+		}
+		# check all fields
+		if ($params->{"attr_values_@{[$attribute->dbID]}"} ne '') {
+		    # numeric fields and unit select menus
+		    if ($attribute->is_numeric) {
+		        push @errors, "Attributes field '@{[$attribute->name]}' needs to be numeric!" unless is_numeric($params->{"attr_values_@{[$attribute->dbID]}"});
+			$search_detail->{$attribute->dbID}->{value} = $params->{"attr_values_@{[$attribute->dbID]}"};
+			if (defined $attribute->search_details) {
+			    if (defined $params->{"attr_units_@{[$attribute->dbID]}"} and $params->{"attr_units_@{[$attribute->dbID]}"} ne '') {
+			        if (defined $attribute->search_details->{$params->{"attr_units_@{[$attribute->dbID]}"}}) {
+				    $search_detail->{$attribute->dbID}->{detail_id} = $params->{"attr_units_@{[$attribute->dbID]}"};
+				} else {
+				    push @errors, "Units error for attributes field '@{[$attribute->name]}'!";
+				}
+		            } else {
+			        push @errors, "Units missing for attributes field '@{[$attribute->name]}'!";
+			    }
+			}
+			if (defined $params->{"attr_oper_@{[$attribute->dbID]}"}     and
+			    is_integer($params->{"attr_oper_@{[$attribute->dbID]}"}) and
+			    defined MIMAS_NUM_SEARCH_OPERS->{$params->{"attr_oper_@{[$attribute->dbID]}"}}) {
+			    $search_detail->{$attribute->dbID}->{oper_id} = $params->{"attr_oper_@{[$attribute->dbID]}"};
+			} else {
+			    push @errors, "Attributes field '@{[$attribute->name]}' operator error!";
+			}
+		    }
+		    # select menus
+		    elsif ($attribute->search_form_type =~ /^select/) {
+		        $params->{"attr_values_@{[$attribute->dbID]}"} =~ s/\0{2,}/\0/g;
+			my @attr_detail_ids = split /\0/, $params->{"attr_values_@{[$attribute->dbID]}"};
+			my %attr_detail_ids;
+			for my $i (reverse 0 .. $#attr_detail_ids) {
+			    # remove "none/not applicable" entries
+                            if ($attr_detail_ids[$i] eq MIMAS_NONE_NA_OPTION) {
+                                splice @attr_detail_ids, $i, 1;
+                                next;
+                            }
+                            $attr_detail_ids{$attr_detail_ids[$i]}++;
+			    if ($attr_detail_ids{$attr_detail_ids[$i]} == 1) {
+			        if (defined $attribute->search_details->{$attr_detail_ids[$i]}) {
+				    $search_detail->{$attribute->dbID}->{detail_ids}->{$attr_detail_ids[$i]}++;
+				} else {
+				    push @errors, "Attributes field '@{[$attribute->name]}' error!";
+				}
+			    } else {
+			        push @errors, "Attributes field '@{[$attribute->name]}' has duplicate selections!";
+			    }
+			}
+			$params->{"attr_values_@{[$attribute->dbID]}"} = join "\0", @attr_detail_ids;
+		    }
+		    # text fields
+		    elsif ($attribute->search_form_type =~ /^text/) {
+		        $search_detail->{$attribute->dbID}->{value} = $params->{"attr_values_@{[$attribute->dbID]}"};
+			if (defined $params->{"attr_oper_@{[$attribute->dbID]}"}     and
+			    is_integer($params->{"attr_oper_@{[$attribute->dbID]}"}) and
+			    defined MIMAS_CHAR_SEARCH_OPERS->{$params->{"attr_oper_@{[$attribute->dbID]}"}}) {
+			    $search_detail->{$attribute->dbID}->{oper_id} = $params->{"attr_oper_@{[$attribute->dbID]}"};
+			} else {
+			    push @errors, "Attributes field '@{[$attribute->name]}' operator error!";
+			}
+		    }
+		    # date fields
+		    elsif ($attribute->search_form_type =~ /^date/) {
+		        $params->{"attr_values_@{[$attribute->dbID]}"} =~ s/\0{2,}/\0/g;
+			my @date_range = split /\0/, $params->{"attr_values_@{[$attribute->dbID]}"};
+			if (scalar @date_range >= 1 and scalar @date_range <= 2) {
+			    my $one_date_exists;
+			    my %date_range =  (from => $date_range[0] || '', to => $date_range[1] || '');
+			    for my $date_key (sort keys %date_range) {
+			        my $date = $date_range{$date_key};
+				$date = clean_whitespace($date);
+				if ($date ne '') {
+				    $one_date_exists++;
+				    if (my ($day, $month, $year) = $date =~ /^(\d{2})-(\d{2})-(\d{4})$/) {
+		                        my $last_days = { '01' => 31, '02' => 28, '03' => 31, '04' => 30, '05' => 31, '06' => 30, 
+			                                  '07' => 31, '08' => 31, '09' => 30, '10' => 31, '11' => 30, '12' => 31 };
+			                if (is_integer($day) and is_integer($month) and is_integer($year) and defined $last_days->{$month} and $day >= 1 and $day <= $last_days->{$month}) {
+			                    $search_detail->{$attribute->dbID}->{$date_key} = $date;
+			                } else {
+			                    push @errors, "Attributes field '@{[$attribute->name]}' date range error!";
+			                }
+		                    } else {
+		                        push @errors, "Attributes field '@{[$attribute->name]}' not in @{[MIMAS_DATE_FORMAT]} format!";
+		                    }
+				}
+			    }
+			    push @errors, "Attributes field '@{[$attribute->name]}' is blank!" unless $one_date_exists;
+			} else {
+			    push @errors, "Attributes field '@{[$attribute->name]}' date range error!";
+			}
+		    }
+		} else {
+		    push @errors, "Attributes field '@{[$attribute->name]}' is blank!";
+		}
+	    }
+	}
+	
+	# process and execute search if no errors
+	unless (@errors) {
+	    ## build and custom repository search SQL statement
+	    my ($search_sql, @search_values);
+	    my $num_search_criteria = scalar keys %{$search_detail};
+        my $select_fields = "D.sample_id, D.experiment_id";
+        my $group_fields = "GROUP BY D.sample_id, D.experiment_id";
+        my $order_fields = "ORDER BY experiment_id, sample_id";
+	    for my $attr_id (sort numerically keys %{$search_detail}) {
+	        my $attribute = $attributes->{$attr_id};
+		
+#		my $from_clause = "mimas.up_sample A" .
+#                                                   " INNER JOIN mimas.up_experiment  E      ON A.experiment_id = E.experiment_id" .
+#                                                   " LEFT  JOIN mimas.user_privilege B      ON A.sample_id = B.sample_id" .
+#		                                   " LEFT  JOIN mimas.group_privilege C     ON A.sample_id = C.sample_id" .
+#						   " INNER JOIN mimas.up_sample_attribute D ON A.sample_id = D.sample_id";
+
+#		my $from_clause = "mimas.sample A LEFT  JOIN mimas.user_privilege B   ON A.sample_id = B.sample_id" .
+#		                                " LEFT  JOIN mimas.group_privilege C  ON A.sample_id = C.sample_id" .
+#						" INNER JOIN mimas.sample_attribute D ON A.sample_id = D.sample_id";
+		
+                
+                my $attr_ddl = $TMP_VIEW_SAMPLE_ATTRIBUTE;
+
+#                my $perm_ddl = $TMP_VIEW_USER_EXP_PRIVILEGE;
+#		my $from_clause = "($attr_ddl) D       JOIN ($perm_ddl) C   ON D.experiment_id = C.experiment_id";
+
+		my $from_clause = "($attr_ddl) D ";
+                
+#                $from_clause .= qq[
+#                    JOIN (
+#                        SELECT u.user_id, u.lab_id, ug.group_id FROM
+#                        mimas.mimas_user u
+#                        LEFT JOIN mimas.user_to_group ug ON ug.user_id=u.user_id 
+#                    ) B ON ( B.group_id=C.group_id OR B.user_id=C.owner_id) AND COALESCE(C.lab_id, B.lab_id) = B.lab_id
+#                    JOIN mimas.lab l ON B.lab_id=l.lab_id  AND COALESCE(C.organization_id, l.organization_id) = l.organization_id
+#                ];
+
+		$search_sql .= defined $search_sql      ? " INTERSECT SELECT          $select_fields FROM $from_clause" : 
+		               $num_search_criteria > 1 ?            "SELECT          $select_fields FROM $from_clause" : 
+			                                             "SELECT DISTINCT $select_fields FROM $from_clause";
+	        
+		# numeric fields and unit select menus
+		if ($attribute->is_numeric) {
+		    my $numeric_value = $search_detail->{$attribute->dbID}->{value};
+		    my $operator      = MIMAS_NUM_SEARCH_OPERS->{$search_detail->{$attribute->dbID}->{oper_id}}->{symbol};
+	            if (defined $attribute->search_details) {
+		        my $attr_detail = $attribute->search_details->{$search_detail->{$attribute->dbID}->{detail_id}};
+			$search_sql .= " INNER JOIN mimas.attr_detail E ON D.attr_detail_id = E.attr_detail_id";
+			$search_sql .= " WHERE D.attribute_id = ?";
+			$search_sql .= " AND (D.numeric_value + E.base_conv_scalar) * E.base_conv_factor $operator (? + ?) * ?";
+	                push @search_values, ($attribute->dbID, $numeric_value, $attr_detail->base_conv_scalar, $attr_detail->base_conv_factor);
+		    } else {
+		        $search_sql .= " WHERE D.attribute_id = ?";
+			$search_sql .= " AND D.numeric_value $operator ?";
+			push @search_values, ($attribute->dbID, $numeric_value);
+		    }
+	        }
+		# select menus
+		elsif ($attribute->search_form_type =~ /^select/) {
+	            my @attr_detail_ids = sort numerically keys %{$search_detail->{$attribute->dbID}->{detail_ids}};
+		    my $placeholder_str = join ',', ('?') x @attr_detail_ids;
+                    $search_sql .= " WHERE D.attribute_id = ?";
+		    $search_sql .= " AND D.attr_detail_id IN ($placeholder_str)";
+		    push @search_values, ($attribute->dbID, @attr_detail_ids);
+	        }
+		# text fields
+		elsif ($attribute->search_form_type =~ /^text/) {
+	            my $lc_search_str = lc $search_detail->{$attribute->dbID}->{value};
+		    my $pattern       = MIMAS_CHAR_SEARCH_OPERS->{$search_detail->{$attribute->dbID}->{oper_id}}->{pattern};
+		    $pattern =~ s/\?/$lc_search_str/;
+		    $search_sql .= " WHERE D.attribute_id = ?";
+		    $search_sql .= defined MIMAS_CHAR_SEARCH_OPERS->{$search_detail->{$attribute->dbID}->{oper_id}}->{not}
+		                     ? " AND LOWER(D.char_value) NOT LIKE ?"
+				     : " AND LOWER(D.char_value) LIKE ?";
+                    push @search_values, $attribute->dbID, $pattern;
+	        }
+		# date fields
+		elsif ($attribute->search_form_type =~ /^date/) {
+	            my $date_from = $search_detail->{$attribute->dbID}->{from} || undef;
+		    my $date_to   = $search_detail->{$attribute->dbID}->{to}   || undef;
+		    $search_sql .= " WHERE D.attribute_id = ?";
+		    $search_sql .= " AND TO_DATE(D.char_value) >= TO_DATE(?, '@{[MIMAS_DATE_FORMAT]}')" if defined $date_from;
+		    $search_sql .= " AND TO_DATE(D.char_value) <= TO_DATE(?, '@{[MIMAS_DATE_FORMAT]}')" if defined $date_to;
+		    push @search_values, $attribute->dbID;
+		    push @search_values, $date_from if defined $date_from;
+		    push @search_values, $date_to   if defined $date_to;
+	        }
+	    }
+
+        $search_sql .= "\n" . $group_fields;
+        $search_sql .= "\n" . $order_fields;
+
+	    
+	    # execute SQL statement, retrieve result sample IDs & add information to session
+            my @result_sample_ids;
+            {
+                my $sth = $mimas_db->dbh->prepare($search_sql);
+                $sth->execute(@search_values);
+                my ($sample_id, $experiment_id);
+                $sth->bind_columns(\($sample_id, $experiment_id));
+
+                #store for each experiment, undef if the experiment is not readable, 0 if it is readonly, 1 if it is writable
+                my %experiment_cache;
+                while ($sth->fetch) {
+                    if (!exists $experiment_cache{$experiment_id}) {
+                        my $can_read = $mimas_db->Upload->AuthAdaptor->auth_reader(-user_id => $user->dbID, -experiment_id => $experiment_id );
+                        if ($can_read) {
+                            my $can_write = $mimas_db->Upload->AuthAdaptor->auth_writer(-user_id => $user->dbID, -experiment_id => $experiment_id );
+                            $experiment_cache{$experiment_id} = $can_write ? 1 : 0;
+                        }
+                        else {
+                            $experiment_cache{$experiment_id} = undef;
+                        }
+                    }
+
+                    my $can_write = $experiment_cache{$experiment_id};
+                    if (defined $can_write) { #if can_write is 0 or 1 (not undef)
+                        push @result_sample_ids, [$sample_id, $can_write];
+                    }
+
+                }
+            }
+
+#	    my $result_sample_ids = $mimas_db->dbh->selectall_arrayref($search_sql, undef, @search_values);
+
+	    $mimas_web->session->{search}->{result_sample_ids} = \@result_sample_ids;
+	    $mimas_web->session->{search}->{detail}            = $search_detail;
+	    $mimas_web->session->{timestamp}                   = time;
+	    
+	    # after processing POST redirect to "search_results"
+	    print $mimas_web->cgi->redirect("$base/search?page=search_results&session_id=${session_id}");
+	    
+	    # store session
+	    $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+	    
+	    exit;
+	}
+    }
+    #
+    ## REQUEST DOWNLOAD: sample download request
+    #
+    elsif (($web_page eq 'search_results' or $web_page eq 'view_sample') and (defined $params->{download_sample_ids} or defined $params->{download_exp_ids})) {
+        my @download_sample_ids = split /\0/, $params->{download_sample_ids};
+        my @download_exp_ids = split /\0/, $params->{download_exp_ids};
+        
+        my %download_samples;
+        for my $sample_id (@download_sample_ids) {
+            my $sample = $mimas_db->Upload->SampleAdaptor->select_by_dbID($sample_id);
+            push @errors, "Sample ID: $sample_id does not exist in MIMAS Repository!" unless defined $sample;
+            push @errors, "Sample ID: $sample_id not authorized!" unless
+                $mimas_db->Upload->AuthAdaptor->auth_reader(
+                    -user_id       => $user->dbID,
+                    -experiment_id => $sample->experiment->dbID,
+                );
+            $download_samples{$sample_id} = $sample;
+        }
+        for my $exp_id (@download_exp_ids) {
+            my $samples = $mimas_db->Upload->SampleAdaptor->select_all_by_expID($exp_id);
+            push @errors, "Experiment ID: $exp_id does not exist in MIMAS Repository, or has no samples attached!" unless defined $samples;
+            push @errors, "Experiment ID: $exp_id not authorized!" unless
+                $mimas_db->Upload->AuthAdaptor->auth_reader(
+                    -user_id       => $user->dbID,
+                    -experiment_id => $exp_id,
+                );
+            $download_samples{$_->dbID} = $_ for values %$samples;
+        }
+	
+#	my $jobs = $user->jobs;
+#	push @errors, "You have exceeded the amount of job requests allowed." if defined $jobs and scalar @{$jobs} >= MIMAS_MAX_JOB_REQUESTS;
+	
+	# process download request if no errors
+	unless (@errors) {
+	    my $job_id;
+	    eval {
+	        my $data = {
+		  sample_ids   => [keys %download_samples],
+		  archive_type => $mimas_web->cgi->user_agent =~ /linux/i ? 'TGZ' : 'ZIP'
+		};             
+		
+		$job_id = $mimas_db->Web->JobAdaptor->store(-type    => 'SAMPLE DOWNLOAD',
+							    -data    => $data,
+							    -user_id => $user->dbID);
+		
+		# commit to DB
+		$mimas_db->commit();
+	    };
+	    
+	    unless ($@) {
+	        # session processing
+	        $mimas_web->session->{requests}->{last_job_id} = $job_id;
+	        $mimas_web->session->{timestamp} = time;
+		
+	        # after processing POST without errors recall page as GET
+	        print $mimas_web->cgi->redirect("$base/search?page=request_download&session_id=${session_id}");
+		
+		# store session
+		$mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+		
+	        exit;
+	    } else {
+	        push @errors, MIMAS_DB_ERROR_MSG;
+		$mimas_db->warn("REQUEST DOWNLOAD SAMPLES transaction aborted:\n$@");
+	    }
+	}
+    }
+    #
+    ## bad POST action
+    #
+    else {
+        push @errors, 'Invalid action!';
+    }
+}
+#
+## GET processing & error checking
+#
+elsif ($mimas_web->cgi->request_method eq 'GET') {
+    #
+    ## SEARCH REPOSITORY: clear entire search
+    #
+    if ($web_page eq 'search_rep' and defined $params->{clear_search}) {
+        delete $mimas_web->session->{search};
+        $mimas_web->session->{timestamp} = time;
+        
+        # after clearing session recall myself
+        print $mimas_web->cgi->redirect("$base/search?page=${web_page}&session_id=${session_id}");
+        
+        # store session
+        $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+        
+        exit;
+    }
+    #
+    ## SEARCH REPOSITORY: clear detail search setup and search results
+    #
+    elsif ($web_page eq 'search_rep' and defined $params->{clear_detail}) {
+        delete $mimas_web->session->{search}->{detail};
+        delete $mimas_web->session->{search}->{result_sample_ids};
+        $mimas_web->session->{timestamp} = time;
+        
+        # after clearing detail setup and search results recall myself
+        print $mimas_web->cgi->redirect("$base/search?page=${web_page}&session_id=${session_id}");
+        
+        # store session
+        $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+        
+        exit;
+    }
+    #
+    ## VIEW SAMPLE: check for valid sample ID
+    #
+    elsif ($web_page eq 'view_sample') {
+        if (!defined $params->{sample_id}) {
+	    push @errors, "Sample ID required to view sample!";
+	} elsif (is_integer($params->{sample_id})) {
+            my $sample = $mimas_db->Upload->SampleAdaptor->select_by_dbID($params->{sample_id});
+            if (!defined $sample) {
+                push @errors, "Sample ID: $params->{sample_id} does not exist in MIMAS!";
+            } else {
+                push @errors, "Sample ID: $params->{sample_id} not authorized!" unless
+                $mimas_db->Upload->AuthAdaptor->auth_reader(
+                    -user_id       => $user->dbID,
+                    -experiment_id => $sample->experiment->dbID,
+                );
+            }
+
+        } else {
+            push @errors, "Sample ID: $params->{sample_id} is not an integer!";
+        }
+    }
+}
+#
+## bad page request
+#
+else {
+    push @errors, 'Invalid page request!';
+}
+
+if (@errors) {
+    eval {
+      $mimas_db->Web->rollback();
+    };
+    $mimas_web->error(@errors);
+}
+
+
+#
+## HTML GENERATION: do the page specific data object preparation, processing, and HTML page setup
+#
+my ($body, $jscript, $title, $onunload);
+
+if ($web_page eq 'search_rep') {
+    my $attr_groups = $mimas_db->Library->AttrGroupAdaptor->select_all();
+    my $attributes  = $mimas_db->Library->AttributeAdaptor->select_all();
+    
+    my @selected_attr_ids = (defined $mimas_web->session->{search} and defined $mimas_web->session->{search}->{selected_attr_ids})   
+                               ? @{$mimas_web->session->{search}->{selected_attr_ids}}
+			       : ();
+    
+    my %selected_attr_ids = map { $_ => 1 } @selected_attr_ids;
+    
+    # prepare HTML
+    my $attrs_obj = '{';
+    my ($pick_attrs_html, $selected_attrs_html) = ('') x 2;
+    for my $attr_group (sort { $a->view_display_order <=> $b->view_display_order } values %{$attr_groups}) {
+        $pick_attrs_html .= "<optgroup id='optgroup_attrs_@{[$attr_group->dbID]}' class='bld' label='@{[$attr_group->name]}:'>";
+	for my $attribute (sort by_order_then_name values %{$attr_group->attributes}) {
+	    my $attr_name_html  = $mimas_web->cgi->escapeHTML($attribute->name);
+	    if (defined $selected_attr_ids{$attribute->dbID}) {
+	        $selected_attrs_html .= "<option value='@{[$attribute->dbID]}'>$attr_name_html";
+	    } else {
+	        $pick_attrs_html     .= "<option value='@{[$attribute->dbID]}'>$attr_name_html";
+	    }
+	    
+	    # create JavaScript object
+            $attrs_obj .= " \"attr_values_@{[$attribute->dbID]}\": {";
+            my $name    = escapeJS($attribute->name);
+            $attrs_obj .= " name: \"$name\",";
+	    $attrs_obj .= " group_id: @{[$attr_group->dbID]},";
+	    $attrs_obj .= " order: @{[$attribute->display_order]}," if defined $attribute->display_order;
+            $attrs_obj .= ' required: 1,'                           if $attribute->required eq 'required';
+            $attrs_obj .= ' is_numeric: 1,'                         if $attribute->is_numeric;
+	    $attrs_obj .= ' is_date: 1,'                            if $attribute->search_form_type =~ /^date/i;
+            chop $attrs_obj;
+            $attrs_obj .= ' },';
+	}
+	$pick_attrs_html .= "</optgroup>";
+    }
+    chop $attrs_obj;
+    $attrs_obj .= ' }';
+    
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="page" value="$web_page">
+    HTML
+    
+    my $detail_setup_html = '';
+    if (@selected_attr_ids) {
+        my $search_detail = (defined $mimas_web->session->{search} and
+	                     defined $mimas_web->session->{search}->{detail})
+			       ? $mimas_web->session->{search}->{detail}
+			       : undef;
+        
+	my $detail_rows_html;
+	my $counter   = 1;
+        my $num_attrs = scalar @selected_attr_ids;
+        for my $attr_id (@selected_attr_ids) {
+            my $attribute      = $attributes->{$attr_id};
+            
+            my $td_class01     = $counter != $num_attrs  ? 'cell01w25pct' : 'cell03w25pct';
+            my $td_class02     = $counter != $num_attrs  ? 'cell02'       : 'cell04';
+            my $title_html     = $mimas_web->cgi->escapeHTML(defined $attribute->description ? $attribute->description : '');
+            my $attr_name_html = $mimas_web->cgi->escapeHTML($attribute->name);
+            
+            $detail_rows_html .= "<tr><td class='${td_class01}'><span class='attribute01' title='$title_html'>$attr_name_html</span></td>";
+            
+            # create input field for attribute if needs a select-multiple element
+            if ($attribute->search_form_type =~ /^select/) {
+	        my $detail_selected;
+		# general case (attribute has values described in MIMAS Library)
+	        if (defined $attribute->search_details) {
+                    my ($pick_attr_values_html, $selected_attr_values_html) = ('') x 2;
+		    for my $value (sort by_order_then_name values %{$attribute->search_details}) {
+		        my $value_html = $mimas_web->cgi->escapeHTML($value->name);
+			if (defined $search_detail                                  and 
+                            defined $search_detail->{$attribute->dbID}              and
+                            defined $search_detail->{$attribute->dbID}->{detail_ids} and
+                            defined $search_detail->{$attribute->dbID}->{detail_ids}->{$value->dbID}) {
+                            $selected_attr_values_html .= "<option value='@{[$value->dbID]}'>$value_html</option>";
+			    $detail_selected++;
+			} elsif (!$detail_selected and $value->default) {
+			    $selected_attr_values_html .= "<option value='@{[$value->dbID]}'>$value_html</option>";
+			    $detail_selected++;
+			} else {
+			    $pick_attr_values_html     .= "<option value='@{[$value->dbID]}'>$value_html</option>";
+			}
+		    }
+		    
+		    $detail_rows_html .= <<"                    HTML";
+                    <td class="${td_class02}nopad">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td class="cell03w50pct" rowspan="2"><select multiple class="w100pct" name="pick_attr_values_@{[$attribute->dbID]}" size="6">$pick_attr_values_html</select></td>
+                          <td class="cell01ctrwmin"><input class="button01w60" type="button" value="ADD &rarr;" onClick="checkselectmulti(this.form, 'pick_attr_values_@{[$attribute->dbID]}', 'attr_values_@{[$attribute->dbID]}')"></td>
+                          <td class="cell04w50pct" rowspan="2"><select multiple class="w100pct" name="attr_values_@{[$attribute->dbID]}" size="6">$selected_attr_values_html</select></td>
+                        </tr>
+                        <tr>
+                          <td class="cell03ctrwmin"><input class="button01w60" type="button" value="&larr; REMOVE" onClick="checkselectmulti(this.form, 'attr_values_@{[$attribute->dbID]}', 'pick_attr_values_@{[$attribute->dbID]}')"></td>
+                        </tr>
+                      </table>
+                    </td>
+                    HTML
+		}
+	        else {
+	            $detail_rows_html .= "<td class='${td_class02}'><img width='1' height='1' alt='' src='/images/spacer.gif'></td>";
+	        }
+	    }
+	    # create input field for attribute if needs a text element
+            elsif ($attribute->search_form_type =~ /^text/) {
+                my $value_html = (defined $search_detail                     and
+                                  defined $search_detail->{$attribute->dbID} and
+                                  defined $search_detail->{$attribute->dbID}->{value})
+                                    ? $mimas_web->cgi->escapeHTML($search_detail->{$attribute->dbID}->{value})
+                                    : '';
+                
+                $detail_rows_html .= "<td class='${td_class02}'>";
+                
+		# numeric text fields
+                if ($attribute->is_numeric) {
+                    $detail_rows_html .= "<table cellpadding='0' cellspacing='0' border='0'><tr><td><select class='w140' name='attr_oper_@{[$attribute->dbID]}'>";
+                    for my $oper_id (sort numerically keys %{+MIMAS_NUM_SEARCH_OPERS}) {
+                        my $display        = MIMAS_NUM_SEARCH_OPERS->{$oper_id}->{display};
+                        my $selected       = (defined $search_detail                                and
+                                              defined $search_detail->{$attribute->dbID}            and
+                                              defined $search_detail->{$attribute->dbID}->{oper_id} and
+                                              $search_detail->{$attribute->dbID}->{oper_id} == $oper_id) ? 'selected' : '';
+                        my $display_html   = $mimas_web->cgi->escapeHTML($display);
+                        $detail_rows_html .= "<option value='$oper_id' $selected>$display_html";
+                    }
+                    $detail_rows_html .= "</select></td>";
+                    
+                    $detail_rows_html .= "<td><input class='numeric01' type='text' name='attr_values_@{[$attribute->dbID]}' value='$value_html'></td>";
+                    
+                    # create units select element for attribute if needed
+                    # (right now only text input elements would ever need units)
+                    if (defined $attribute->search_details) {
+                        my $detail_selected;
+			$detail_rows_html .= "<td><select name='attr_units_@{[$attribute->dbID]}'>";
+                        for my $unit (sort by_order_then_name values %{$attribute->search_details}) {
+		            my $selected       = (defined $search_detail                                  and
+			                          defined $search_detail->{$attribute->dbID}              and
+						  defined $search_detail->{$attribute->dbID}->{detail_id} and
+				                  $search_detail->{$attribute->dbID}->{detail_id} == $unit->dbID) ? 'selected' :
+						 (!$detail_selected and $unit->default)                           ? 'selected' : '';
+                            my $unit_html      = $mimas_web->cgi->escapeHTML($unit->name);
+                            $detail_rows_html .= "<option value='@{[$unit->dbID]}' $selected>$unit_html";
+			    $detail_selected++ if $selected;
+                        }
+                        $detail_rows_html .= "</select></td>";
+                    }
+                    $detail_rows_html .= "</tr></table></td>";
+                }
+		# string text fields
+		else {
+                    $detail_rows_html .= "<table width='100%' cellpadding='0' cellspacing='0' border='0'><tr><td><select class='w140' name='attr_oper_@{[$attribute->dbID]}'>";
+                    for my $oper_id (sort numerically keys %{+MIMAS_CHAR_SEARCH_OPERS}) {
+                        my $display        = MIMAS_CHAR_SEARCH_OPERS->{$oper_id}->{display};
+                        my $selected       = (defined $search_detail                                and
+                                              defined $search_detail->{$attribute->dbID}            and
+                                              defined $search_detail->{$attribute->dbID}->{oper_id} and
+                                              $search_detail->{$attribute->dbID}->{oper_id} == $oper_id) ? 'selected' : '';
+                        my $display_html   = $mimas_web->cgi->escapeHTML($display);
+                        $detail_rows_html .= "<option value='$oper_id' $selected>$display_html";
+                    }
+                    $detail_rows_html .= "</select></td>";
+                    $detail_rows_html .= "<td class='w100pct'><input class='w100pct' type='text' name='attr_values_@{[$attribute->dbID]}' value='$value_html'></td>";
+                    $detail_rows_html .= "</tr></table></td>";
+                }
+	    }
+	    # create input field for attribute if needs a date element
+            elsif ($attribute->search_form_type =~ /^date/) {
+                my ($from_value, $to_value, $class);
+                if (defined $search_detail->{$attribute->dbID}->{from} or defined $search_detail->{$attribute->dbID}->{to}) {
+                    $from_value = $search_detail->{$attribute->dbID}->{from} || '';
+                    $to_value   = $search_detail->{$attribute->dbID}->{to}   || '';
+                    $class      = 'date01';
+                } else {
+                    $from_value = $to_value = MIMAS_DATE_FORMAT;
+                    $class      = 'date01init';
+                }
+                
+                $detail_rows_html .= <<"                HTML";
+                <td class="${td_class02}">
+                  <table cellpadding="0" cellspacing="0" border="0">
+                    <tr>
+                      <td class="date01">From:</td>
+                      <td><input class="$class" type="text" id="" name="attr_values_@{[$attribute->dbID]}" value="$from_value" maxlength="10" onFocus="checkdatefield(this)"></td>
+                      <td class="date02">To:</td>
+                      <td><input class="$class" type="text" id="" name="attr_values_@{[$attribute->dbID]}" value="$to_value"   maxlength="10" onFocus="checkdatefield(this)"></td>
+                    </tr>
+                  </table>
+                </td>
+                HTML
+	    }
+	    else {
+	        $detail_rows_html .= "<td class='${td_class02}'><img width='1' height='1' alt='' src='/images/spacer.gif'></td>";
+	    }
+
+            $detail_rows_html .= "</tr>";
+            $counter++;
+        }
+        
+        $detail_setup_html = <<"        HTML";
+        <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+        <tr>
+          <td>
+            <form name="search_repository" method="post" action="$base/search" onSubmit="return checksearchrep(this, attrsobj)" onReset="if (confirm('Clear detail search setup?')) location.replace('@{[$mimas_web->cgi->url(-absolute => 1, -query => 1)]}&clear_detail=1'); else return false">
+              <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+                <tr><td class="tableheader01">Search MIMAS Repository</td></tr>
+	        <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	        <tr>
+	          <td>
+	            <table width="100%" cellpadding="0" cellspacing="0" border="0">
+	              $detail_rows_html
+	            </table>
+	          </td>
+	        </tr>
+	        <tr><td class="submit"><input class="submitw115" type="submit" value="SEARCH REPOSITORY"></td></tr>
+	        <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+              </table>
+              $hidden_html
+            </form>
+          </td>
+        </tr>
+        HTML
+    }
+
+    $body = <<"    HTML";
+    <tr><td class="header01">Search the MIMAS Repository</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr>
+      <td>
+        <form name="select_criteria" method="post" action="$base/search" onSubmit="return checkselectcriteria(this)" onReset="if (confirm('Clear entire search and start over?')) location.replace('@{[$mimas_web->cgi->url(-absolute => 1, -query => 1)]}&clear_search=1'); else return false">
+          <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+            <tr><td class="tableheader01">Select Search Criteria</td></tr>
+	    <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	    <tr>
+	      <td>
+	        <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td class="cell03w50pct" rowspan="2"><select multiple class="w100pct" name="pick_attr_ids" size="10">$pick_attrs_html</select></td>
+                    <td class="cell01ctrwmin"><input class="button01w60" type="button" value="ADD &rarr;" onClick="addsearchcriteria(this.form, attrsobj, 'pick_attr_ids', 'selected_attr_ids')"></td>
+                    <td class="cell04w50pct" rowspan="2"><select multiple class="w100pct" name="selected_attr_ids" size="10">$selected_attrs_html</select></td>
+                  </tr>
+                  <tr>
+                    <td class="cell03ctrwmin"><input class="button01w60" type="button" value="&larr; REMOVE" onClick="removesearchcriteria(this.form, attrsobj, 'selected_attr_ids', 'pick_attr_ids')"></td>
+                  </tr>
+                </table>
+	      </td>
+	    </tr>
+	    <tr><td class="submit"><input class="submitw115" type="submit" value="SET UP SEARCH"></td></tr>
+	    <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+          </table>
+          $hidden_html
+        </form>
+      </td>
+    </tr>
+    $detail_setup_html
+    HTML
+
+    $jscript = <<"    JSCRIPT";
+    var attrsobj = $attrs_obj;
+    JSCRIPT
+    
+    $title    = 'Search Repository';
+    $onunload = '';
+    
+}
+elsif ($web_page eq 'search_results') {
+    my (@page_sample_ids, $page_start, $page_end, $num_total_samples, $end_start, $prev_start, $next_start);
+    if (defined $mimas_web->session->{search}                      and 
+        defined $mimas_web->session->{search}->{result_sample_ids} and 
+              @{$mimas_web->session->{search}->{result_sample_ids}}) {
+        
+        my @result_sample_ids = @{$mimas_web->session->{search}->{result_sample_ids}};
+        my $page_start_idx    = (defined $params->{start} and is_integer($params->{start}))
+                                  ? $params->{start} > 0
+		                      ? $params->{start} <= $#result_sample_ids
+		                          ? $params->{start} - 1
+			                  : $#result_sample_ids
+		                      : 0
+		                  : 0;
+        my $page_end_idx      = ($page_start_idx + MIMAS_SAMPLES_PER_PAGE - 1 > $#result_sample_ids)
+                                  ? $#result_sample_ids
+		                  : $page_start_idx + MIMAS_SAMPLES_PER_PAGE - 1;
+        
+        @page_sample_ids      = @result_sample_ids[$page_start_idx .. $page_end_idx];
+	$page_start           = $page_start_idx + 1;
+	$page_end             = $page_end_idx + 1;
+	$num_total_samples    = scalar @result_sample_ids;
+	
+	$end_start            = $num_total_samples <= MIMAS_SAMPLES_PER_PAGE
+	                          ? 1
+				  : int($num_total_samples/MIMAS_SAMPLES_PER_PAGE) * MIMAS_SAMPLES_PER_PAGE + 1;
+	
+	$prev_start           = $page_start - MIMAS_SAMPLES_PER_PAGE < 1
+	                          ? 1
+				  : $page_start - MIMAS_SAMPLES_PER_PAGE;
+	$next_start           = $page_start + MIMAS_SAMPLES_PER_PAGE > $end_start
+	                          ? $end_start
+				  : $page_start + MIMAS_SAMPLES_PER_PAGE;
+    }
+    
+    my ($samples, $experiments, $all_sample_attrs);
+    for my $item (@page_sample_ids) {
+        my ($sample_id) = @$item;
+        my $sample = $mimas_db->Upload->SampleAdaptor->select_by_dbID($sample_id);
+        my $experiment_id = $sample->{experiment_id};
+        $experiments->{$experiment_id} = $mimas_db->Upload->ExperimentAdaptor->select_by_dbID($experiment_id) unless exists $experiments->{$experiment_id};
+        $samples->{$sample_id} = $sample;
+	# Get only the attribute data I need versus all of it (for speed)
+	$all_sample_attrs->{$sample_id}->{'experiment'} = $experiments->{$experiment_id};
+        $all_sample_attrs->{$sample_id}->{'Sample Name'}   = $sample->name;
+        my $h = $mimas_db->Upload->ExpAttributeAdaptor->select_all_by_attr_name_expID(-attribute_name => 'Author(s)',
+	                                                                              -experiment_id  => $sample->{experiment_id});
+        $all_sample_attrs->{$sample_id}->{'Author(s)'}     = shift(@{[values(%$h)]})->char_value if $h;
+    }
+    
+    # prepare HTML
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="page" value="$web_page">
+    HTML
+    
+    my $sample_results_html;
+    if (@page_sample_ids) {
+        my $sample_rows_html;
+        my $counter     = 1;
+        my $num_page_samples = scalar @page_sample_ids;
+        for my $item (@page_sample_ids) {
+            my ($sample_id, $can_write) = @$item;
+            my $experiment      = $all_sample_attrs->{$sample_id}->{'experiment'};
+            my $experiment_id   = $experiment->dbID;
+	    my $owner_full_name = $experiment->owner->full_name_reversed;
+	    
+	    my $sample_name_html  = $mimas_web->cgi->escapeHTML($all_sample_attrs->{$sample_id}->{'Sample Name'});
+	    my $sample_auth_html  = $mimas_web->cgi->escapeHTML($all_sample_attrs->{$sample_id}->{'Author(s)'} || 'not specified');
+	    my $sample_owner_html = $mimas_web->cgi->escapeHTML($owner_full_name);
+	    
+	    my $td_class01 = $counter != $num_page_samples ? 'cell01' : 'cell03';
+	    my $td_class02 = $counter != $num_page_samples ? 'cell02' : 'cell04';
+
+            my $edit_visible = "display:none";
+            my $sample_page = "sample_attrs";
+            if ($can_write && $experiment->state == MIMAS_UPLOAD_WORKING) {
+                $edit_visible = "";
+                if ($experiment->progress >= MIMAS_UPLOAD_SAMPLE_ATTRS_PROGRESS) {
+                }
+                else {
+                    $sample_page = "file_upload";
+                }
+            }
+
+	    
+	    $sample_rows_html .= <<"            HTML";
+	    <tr>
+	      <td class="${td_class01}">$sample_id</td>
+	      <td class="${td_class01}">$experiment_id</td>
+	      <td class="${td_class01}">$sample_name_html</td>
+	      <td class="${td_class01}">$sample_owner_html</td>
+	      <td class="${td_class01}">$sample_auth_html</td>
+	      <td class="${td_class01}ctrwmin"><input class="button01w60" type="button" title="Click to view this sample" onClick="location.href='$base/search?page=view_sample&session_id=${session_id}&sample_id=${sample_id}'" value="VIEW"></td>
+	      <td class="${td_class01}ctrwmin"><input class="button01w60" style="$edit_visible" type="button" title="Click to view this sample" onClick="location.href='upload?page=$sample_page&session_id=${session_id}&sample_id=${sample_id}'" value="EDIT"></td>
+	      <td class="${td_class02}ctr"><input type="checkbox" name="download_sample_ids" value="$sample_id"></td>
+	    </tr>
+            HTML
+	    
+	    $counter++;
+        }
+        
+        $sample_results_html = <<"        HTML";
+        <tr>
+	  <td>
+	    <form name="request_download" method="post" action="$base/search" onSubmit="return checkdownloadrequest(this)">
+              <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+                <tr><td class="tableheader01">Samples</td></tr>
+	        <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+                <tr>
+	          <td>
+	            <table width="100%" cellpadding="0" cellspacing="0" border="0">
+	              <tr>
+	                <td class="colheader01wmin"><span class="nowrap">Sample ID</span></td>
+		        <td class="colheader01wmin"><span class="nowrap">Experiment ID</span></td>
+		        <td class="colheader01">Sample Name</td>
+		        <td class="colheader01">Owner</td>
+		        <td class="colheader01">Author(s)</td>
+		        <td class="colheader01ctrwmin"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+		        <td class="colheader01ctrwmin"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+		        <td class="colheader02ctrwmin">Download</td>
+	              </tr>
+	              $sample_rows_html
+	              <tr>
+	                <td class="cellopts01rt" colspan="7"><label for="check_all"><span class="italic">Check All</span></label></td>
+	                <td class="cellopts01"><input type="checkbox" id="check_all" onClick="checkuncheck(this)"></td>
+                      </tr>
+	            </table>
+	          </td>
+	        </tr>
+	        <tr>
+	          <td>
+	            <table width="100%" cellpadding="0" cellspacing="0" border="0">
+		      <tr>
+		        <td class="resultnav01" rowspan="2">
+		          <table cellpadding="0" cellspacing="0" border="0">
+		            <tr>
+			      <td>
+			        <input class="button01w40" type="button" title="Click to go to start of result list" onClick="location.href='$base/search?page=search_results&session_id=${session_id}&start=1'" value="START">
+	                        <input class="button01w40" type="button" title="Click to go to previous results page" onClick="location.href='$base/search?page=search_results&session_id=${session_id}&start=${prev_start}'" value="PREV">
+	                        <input class="button01w40" type="button" title="Click to go to next results page" onClick="location.href='$base/search?page=search_results&session_id=${session_id}&start=${next_start}'" value="NEXT">
+	                        <input class="button01w40" type="button" title="Click to go to end of results list" onClick="location.href='$base/search?page=search_results&session_id=${session_id}&start=${end_start}'" value="END">
+			      </td>
+			    </tr>
+			    <tr><td class="resultnav02">$page_start - $page_end (<span class="italic">out of $num_total_samples</span>)</td></tr>
+		          </table>
+		        </td>
+		        <td class="submit"><input class="submitw115" type="submit" value="REQUEST DOWNLOAD"></td>
+		      </tr>
+		      <tr><td class="reset"><input class="resetw115" type="reset" value="Reset"></td></tr>
+		    </table>
+	          </td>
+	        </tr>
+              </table>
+              $hidden_html
+            </form>
+	  </td>
+	</tr>
+        HTML
+    } else {
+        $sample_results_html = <<"        HTML";
+	<tr><td><span class="italic">NO SAMPLES MATCH YOUR SEARCH CRITERIA...</span></td></tr>
+	<tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+	<tr><td><input class="button01w115" type="button" onClick="location.href='$base/search?page=search_rep&session_id=${session_id}'" value="GO BACK TO SEARCH"></td></tr>
+        HTML
+    }
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">Repository Search Results</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    $sample_results_html
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title    = 'Repository Search Results';
+    $onunload = '';
+    
+}
+elsif ($web_page eq 'view_sample') {
+    my $attr_groups  = $mimas_db->Library->AttrGroupAdaptor->select_all();
+    my $attributes   = $mimas_db->Library->AttributeAdaptor->select_all();
+    my $sample       = $mimas_db->Upload->SampleAdaptor->select_by_dbID($params->{sample_id});
+    
+    my $grouped_attrs;
+    for my $attribute (sort { $a->dbID <=> $b->dbID } values %{$attributes}) {
+        push @{$grouped_attrs->{$attribute->attr_group->dbID}}, $attribute;
+    }
+    
+    my $sample_extended_attrs = $sample->extended_attributes;
+    my $sample_name;
+    for my $attribute_id (keys %$sample_extended_attrs) {
+        next unless $attributes->{$attribute_id}->name eq 'Sample Name';
+        ($sample_name) = map {$_->char_value} values %{$sample_extended_attrs->{$attribute_id}};
+    }
+    
+    # prepare HTML
+    my $result_nav_html = '';
+    if (defined $mimas_web->session->{search}                      and 
+        defined $mimas_web->session->{search}->{result_sample_ids} and 
+              @{$mimas_web->session->{search}->{result_sample_ids}}) {
+        
+        my @result_sample_ids = @{$mimas_web->session->{search}->{result_sample_ids}};
+	
+	my ($sample_idx) = grep $result_sample_ids[$_] == $params->{sample_id}, 0 .. $#result_sample_ids;
+	
+	if (defined $sample_idx) {
+	    my $num_total_samples = scalar @result_sample_ids;
+	    my $first_sample_id   = $result_sample_ids[0];
+	    my $last_sample_id    = $result_sample_ids[$#result_sample_ids];
+	    my $prev_sample_id    = $sample_idx - 1 < 0
+	                              ? $result_sample_ids[0]
+				      : $result_sample_ids[$sample_idx - 1];
+            my $next_sample_id    = $sample_idx + 1 > $#result_sample_ids
+	                              ? $result_sample_ids[$#result_sample_ids]
+				      : $result_sample_ids[$sample_idx + 1];
+            my $sample_pos        = $sample_idx + 1;
+	    
+	    $result_nav_html = <<"            HTML";
+            <tr>
+              <td>
+                <table cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td>
+                      <input class="button01w40" type="button" title="Click to go to first sample in result list" onClick="location.href='$base/search?page=view_sample&session_id=${session_id}&sample_id=${first_sample_id}'" value="START">
+                      <input class="button01w40" type="button" title="Click to go to previous sample in result list" onClick="location.href='$base/search?page=view_sample&session_id=${session_id}&sample_id=${prev_sample_id}'" value="PREV">
+                      <input class="button01w40" type="button" title="Click to go to next sample in result list" onClick="location.href='$base/search?page=view_sample&session_id=${session_id}&sample_id=${next_sample_id}'" value="NEXT">
+                      <input class="button01w40" type="button" title="Click to go to last sample in result list" onClick="location.href='$base/search?page=view_sample&session_id=${session_id}&sample_id=${last_sample_id}'" value="END">
+                    </td>
+                  </tr>
+                  <tr><td class="resultnav02">$sample_pos (<span class="italic">out of $num_total_samples</span>)</td></tr>
+                </table>
+              </td>
+            </tr>
+	    <tr><td><img width="1" height="10" alt="" src="/images/spacer.gif"></td></tr>
+            HTML
+        }
+    }
+    
+    my $view_sample_html = '';
+    for my $attr_group (sort { $a->view_display_order <=> $b->view_display_order } values %{$attr_groups}) {
+        
+        next unless defined $grouped_attrs->{$attr_group->dbID};
+        
+	my $group_name_html = $mimas_web->cgi->escapeHTML($attr_group->name);
+	
+        $view_sample_html .= <<"        HTML";
+        <tr><td class="tablespacer01" colspan="2"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+	<tr><td class="tableheader02" colspan="2">$group_name_html</td></tr>
+	<tr><td class="tablespacer01" colspan="2"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+        HTML
+	
+        my $counter   = 1;
+        my $num_attrs = scalar @{$grouped_attrs->{$attr_group->dbID}};
+        for my $attribute (sort by_order_then_name @{$grouped_attrs->{$attr_group->dbID}}) {
+            my $td_class01     = $counter != $num_attrs ? 'cell01w25pct' : 'cell03w25pct';
+            my $td_class02     = $counter != $num_attrs ? 'cell02wrap'   : 'cell04wrap';
+	    my $title_html     = $mimas_web->cgi->escapeHTML(defined $attribute->description ? $attribute->description : '');
+	    my $attr_name_html = $mimas_web->cgi->escapeHTML($attribute->name);
+	    
+	    if (defined $sample_extended_attrs and defined $sample_extended_attrs->{$attribute->dbID}) {
+	        $view_sample_html  .= "<tr><td class='${td_class01}'><span class='attribute01' title='$title_html'>$attr_name_html</span></td>";
+	        my (@values, $unit);
+	        for my $sample_attr (sort by_attr_info values %{$sample_extended_attrs->{$attribute->dbID}}) {
+	            push @values, defined $sample_attr->char_value    ? $sample_attr->char_value        :
+		                  defined $sample_attr->numeric_value ? $sample_attr->numeric_value     :
+				  defined $sample_attr->detail        ? $sample_attr->detail->name : '';
+                    
+		    $unit = ($attribute->is_numeric and defined $sample_attr->detail)
+		               ? $sample_attr->detail->name
+			       : '';
+	        }
+		
+		my @values_html = map { $mimas_web->cgi->escapeHTML($_) } @values;
+		my $unit_html   = $mimas_web->cgi->escapeHTML($unit);
+		
+		$view_sample_html .= "<td class='${td_class02}'>";
+		$view_sample_html .= join '<br>', @values_html;
+		$view_sample_html .= "&nbsp;&nbsp;$unit_html" if $unit_html;
+		$view_sample_html .= "</td>";
+	    }
+	    
+	    $view_sample_html .= "</tr>";
+	    $counter++;
+        }
+    }
+    
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="page" value="$web_page">
+    HTML
+    
+    $body = <<"    HTML";
+    $result_nav_html
+    <tr>
+      <td>
+        <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+          <tr><td class="tableheader01">SAMPLE ID: @{[$sample->dbID]}&nbsp;&nbsp;NAME: @{[$mimas_web->cgi->escapeHTML($sample_name)]}</td></tr>
+          <tr>
+            <td>
+	      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+	        $view_sample_html
+	      </table>
+            </td>
+          </tr>
+        </table>
+        $hidden_html
+      </td>
+    </tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title    = 'View Repository Sample';
+    $onunload = '';
+    
+}
+elsif ($web_page eq 'request_download') {
+    my $message = (defined $mimas_web->session->{requests} and defined $mimas_web->session->{requests}->{last_job_id})
+                    ? "YOUR DOWNLOAD REQUEST HAS BEEN SUBMITTED (ID: @{[$mimas_web->session->{requests}->{last_job_id}]})...YOU WILL RECEIVE A DOWNLOAD LINK IN YOUR USER HOME PAGE WHEN IT IS READY"
+		    : "NO DOWNLOAD HAS BEEN REQUESTED.";
+    
+    my $hidden_html = <<"    HTML";
+    <input type="hidden" name="session_id" value="$session_id">
+    <input type="hidden" name="page" value="$web_page">
+    HTML
+    
+    $body = <<"    HTML";
+    <tr><td class="header01">Repository Download Request</td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr><td><span class="italic">$message</span></td></tr>
+    <tr><td><img width="1" height="20" alt="" src="/images/spacer.gif"></td></tr>
+    <tr><td><input class="button01w115" type="button" onClick="history.back()" value="RETURN TO RESULTS"></td></tr>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title    = 'Request Repository Download';
+    $onunload = '';
+    
+}
+
+
+#
+## session processing
+#
+$mimas_web->session->{timestamp} = time;
+
+
+#
+## display HTML
+#
+print $mimas_web->cgi->header(-type          => 'text/html',
+                              -charset       => 'utf-8',
+			      -encoding      => 'utf-8'), # -cache_control => 'no-store'),
+      
+      $mimas_web->cgi->start_html(-title     => "MIMAS -- $title",
+                                  -encoding  => 'utf-8',
+                                  -style     => {-src => "/styles/mimas_01.css?session_id=$session_id"},
+		                  -script    => [ {-src => "/js/mimas.js?session_id=$session_id"}, {-code => $jscript} ],
+				  -onUnload  => $onunload),
+      
+      $mimas_web->html->web_page(-template    => 'TEMPLATE_01',
+                                 -main_menu   => 'DEFAULT',
+		                 -detail_menu => 'REPOSITORY',
+		                 -navbar      => 'LOGOUT',
+		                 -body        => $body,
+						 -user        => $user,
+						 ),
+      
+      $mimas_web->cgi->end_html;
+
+
+#
+## store session
+#
+$mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+
+exit;
+

@@ -1,0 +1,202 @@
+#!/usr/bin/perl
+
+# popup
+# MIMAS Website Popup Window Pages
+#
+#######################################################
+# Copyright 2003-2005 Leandro C. Hermida
+# This code is part of MIMAS and is distributed under
+# GNU Public License Version 2.
+#######################################################
+# $Id$
+
+use strict;
+use warnings;
+# for cgi-bin scripts only
+# use lib '../libs';
+use MIMAS::DB;
+use MIMAS::Web;
+use MIMAS::Consts;
+use MIMAS::Utils;
+use MIMAS::Units;
+
+my $mimas_db  = MIMAS::DB->new(-service => 'WEB');
+my $mimas_web = MIMAS::Web->new();
+my $params    = $mimas_web->cgi_Vars;
+
+## for testing
+# print STDERR map("$_ ---> $params->{$_}\n", sort keys %{$params}), "\n";
+##
+
+my $popup_web_pages = {
+                        file_progress   => 1,
+                        new_factor      => 1
+		      };
+
+#
+## Authentication
+#
+unless (defined $params->{session_id}                                                             and 
+        defined $mimas_web->session($mimas_db->Web->SessionAdaptor->fetch($params->{session_id})) and 
+	defined $mimas_web->session->{login}) {
+    $mimas_web->error('Authentication failed!');
+}
+
+#
+## Web Page Check
+#
+$mimas_web->error('Invalid page request!') unless defined $params->{page} and defined $popup_web_pages->{$params->{page}};
+
+#
+## Upload Authentication (for certain popups)
+#
+if ($params->{page} =~ /^(file_progress|new_factor)$/) {
+    $mimas_web->error('Upload authentication failed!') unless defined $mimas_web->session->{upload}                  and
+                                                              defined $mimas_web->session->{upload}->{experiment_id} and
+                                                              $mimas_db->Upload->AuthAdaptor->auth_owner(-state         => MIMAS_UPLOAD_WORKING,
+							                                                 -owner_id      => $mimas_web->session->{user_id},
+							                                                 -experiment_id => $mimas_web->session->{upload}->{experiment_id});
+}
+
+
+my $web_page = $params->{page};
+my $session_id = $mimas_web->session->{_session_id};
+
+
+#
+## only GET allowed for popups
+#
+$mimas_web->error('Invalid page request!') if $mimas_web->cgi->request_method ne 'GET';
+
+
+#
+## HTML GENERATION: do the page specific data object preparation, processing, and HTML page setup
+#
+my ($body, $jscript, $title);
+
+if ($web_page eq 'file_progress') {
+    $body = <<"    HTML";
+    <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+      <tr><td class="tableheader02">File upload in progress.<br>Please wait...(this may take a while!)</td></tr>
+      <tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+      <tr>
+        <td>
+          <table cellpadding="4" cellspacing="4">
+            <tr>
+	      <td id="box1"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box2"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box3"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box4"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box5"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box6"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box7"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box8"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box9"  class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box10" class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box11" class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box12" class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box13" class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box14" class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	      <td id="box15" class="progress01"><img width="1" height="1" alt="" src="/images/spacer.gif"></td>
+	    </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+
+    <script type="text/javascript">
+    <!-- Hide script
+    //<![CDATA[
+    
+    progressupdate(0);
+
+    //]]> End script hiding -->
+    </script>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title = 'File Upload Progress';
+    
+}
+elsif ($web_page eq 'new_factor') {
+    my $unit_groups_html = "<select name='exp_factor_units'><option class='italic' value='@{[MIMAS_NONE_NA_OPTION]}'>@{[MIMAS_NONE_NA_OPTION]}</option>";
+    for my $unit_group_id (sort { lc(MIMAS_UNITS->{$a}->{name}) cmp lc(MIMAS_UNITS->{$b}->{name}) } keys %{+MIMAS_UNITS}) {
+        my $unit_group_html = $mimas_web->cgi->escapeHTML(MIMAS_UNITS->{$unit_group_id}->{name});
+	$unit_groups_html  .= "<option value='$unit_group_id'>$unit_group_html</option>";
+    }
+    $unit_groups_html .= "</select>";
+    
+    $body = <<"    HTML";
+    <form name="new_factor" onSubmit="return checknewfactor(this)">
+      <table class="submain01" cellpadding="0" cellspacing="0" border="0">
+        <tr><td class="tableheader02">New Experimental Factor</td></tr>
+	<tr><td class="tablespacer01"><img width="1" height="5" alt="" src="/images/spacer.gif"></td></tr>
+        <tr>
+          <td>
+            <table width="100%" cellpadding="0" cellspacing="0" border="0">
+	      <tr>
+	        <td class="cell01">Experimental Factor Name:</td>
+	        <td class="cell02w100pct"><input type="text" class="w100pct" name="new_factor_name"></td>
+	      </tr>
+	      <tr>
+	        <td class="cell03">Is the factor numeric?</td>
+	        <td class="cell04w100pct">
+	          <input type="radio" id="numeric_yes" name="is_numeric" value="1" onClick="togglefactorunits(this)"><label for="numeric_yes">Yes</label>
+	          <img width="5" height="1" alt="" src="/images/spacer.gif">
+                  <input type="radio" id="numeric_no"  name="is_numeric" value="0" onClick="togglefactorunits(this)"><label for="numeric_no" >No</label>
+	        </td>
+	      </tr>
+	      <tr id="tr_factor_units" class="hidden">
+	        <td class="cell03">Experimental Factor Units:</td>
+		<td class="cell04w100pct">$unit_groups_html</td>
+	      </tr>
+	      <tr>
+	        <td class="submit" colspan="2"><input class="submitw115" type="submit" value="ADD FACTOR"></td>
+	      </tr>
+	    </table>
+          </td>
+        </tr>
+    </form>
+    HTML
+    
+    $jscript = <<"    JSCRIPT";
+    JSCRIPT
+    
+    $title = 'New Experimental Factor';
+    
+}
+
+
+#
+## session processing
+#
+# $mimas_web->session->{timestamp} = time;
+
+
+#
+## display HTML
+#
+print $mimas_web->cgi->header(-type         => 'text/html',
+                              -charset      => 'utf-8',
+			      -encoding     => 'utf-8'),
+      
+      $mimas_web->cgi->start_html(-title    => "MIMAS -- $title",
+                                  -encoding => 'utf-8',
+                                  -style    => {-src => "/styles/mimas_01.css?session_id=$session_id"},
+		                  -script   => [ {-src => "/js/mimas.js?session_id=$session_id"}, {-code => $jscript} ],
+				  -class    => 'popup'),
+      
+      $body,
+      
+      $mimas_web->cgi->end_html;
+
+
+#
+## store session
+#
+# $mimas_db->Web->SessionAdaptor->store($mimas_web->session);
+
+exit;
+
